@@ -55,14 +55,21 @@ strategies can be plugged in without touching the orchestrator.
 ## Exporting reconstructed samples
 
 After running the main pipeline you can convert the stored tensor file into
-standard image formats:
+standard image formats. The exporter automatically attempts to read the
+dataset name from `metrics.json` or `inference.json`, so in most cases you only
+need to specify the output directory:
 
 ```bash
-python scripts/export_reconstructions.py --dataset cifar10 \
+python scripts/export_reconstructions.py \
     --reconstructions outputs/reconstructed.pt \
-    --inference outputs/inference.json \
     --output outputs/reconstructed_images --grid
 ```
+
+参数说明：
+
+- 若自动探测失败，可通过 `--dataset` 显式指定（可选值：`cifar10`、`cifar100`、
+  `mnist`、`fashionmnist`）。
+- `--inference` 与 `--metadata` 默认指向 `outputs/` 目录下的 JSON，若路径不同需显式设置。
 
 The script automatically inverts the dataset normalisation and writes
 individual images such as `class_6_000.png`. If the inference metadata is

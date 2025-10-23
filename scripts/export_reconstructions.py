@@ -34,8 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset",
         choices=sorted(NORMALIZATION_STATS.keys()),
-        required=True,
-        help="Dataset name used for the experiment (controls the inverse normalisation).",
+        default=None,
+        help=(
+            "Dataset name used for the experiment. If omitted the script attempts to read it "
+            "from --metadata or --inference files."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -57,8 +60,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference",
         type=Path,
-        default=None,
-        help="Optional path to inference.json for annotating filenames with class IDs.",
+        default=Path("outputs/inference.json"),
+        help=(
+            "Optional path to inference.json for annotating filenames with class IDs. "
+            "Defaults to outputs/inference.json."
+        ),
+    )
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=Path("outputs/metrics.json"),
+        help=(
+            "Optional path to metrics.json (or any JSON containing a 'dataset' field). "
+            "Used to auto-detect the dataset when --dataset is not specified."
+        ),
     )
     parser.add_argument(
         "--start-index",
@@ -141,26 +156,55 @@ def determine_prefix(args: argparse.Namespace, metadata: dict | None) -> str:
     return f"pred{predicted}_gt{ground_truth}"
 
 
+def _load_optional_json(path: Path | None, *, strict: bool = False) -> dict | None:
+    if path is None:
+        return None
+
+    if not path.exists():
+        if strict:
+            raise FileNotFoundError(f"Metadata not found: {path}")
+        LOGGER.debug("Metadata file %s not found; skipping", path)
+        return None
+
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_dataset(args: argparse.Namespace, *metadata_sources: dict | None) -> str:
+    if args.dataset is not None:
+        return args.dataset
+
+    for source in metadata_sources:
+        if isinstance(source, dict):
+            dataset = source.get("dataset")
+            if dataset in NORMALIZATION_STATS:
+                LOGGER.info("Detected dataset '%s' from metadata", dataset)
+                return dataset
+
+    valid = ", ".join(sorted(NORMALIZATION_STATS))
+    raise ValueError(
+        "Unable to determine dataset. Provide --dataset explicitly or supply metadata containing "
+        f"a 'dataset' field (valid options: {valid})."
+    )
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.log_level)
 
-    metadata = None
-    if args.inference is not None:
-        if not args.inference.exists():
-            raise FileNotFoundError(f"Inference metadata not found: {args.inference}")
-        with args.inference.open("r", encoding="utf-8") as handle:
-            metadata = json.load(handle)
+    inference_metadata = _load_optional_json(args.inference)
+    metrics_metadata = _load_optional_json(args.metadata)
+    dataset = resolve_dataset(args, metrics_metadata, inference_metadata)
 
     LOGGER.info("Loading reconstructions from %s", args.reconstructions)
     reconstructions = load_reconstructions(args.reconstructions)
     LOGGER.info("Loaded %d samples", reconstructions.shape[0])
 
-    stats = NORMALIZATION_STATS[args.dataset]
+    stats = NORMALIZATION_STATS[dataset]
     images = denormalize(reconstructions, stats).clamp(0.0, 1.0)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    prefix = determine_prefix(args, metadata)
+    prefix = determine_prefix(args, inference_metadata)
 
     LOGGER.info("Saving images to %s with prefix '%s'", args.output, prefix)
     for idx, image in enumerate(images, start=args.start_index):
