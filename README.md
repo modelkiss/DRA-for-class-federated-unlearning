@@ -13,10 +13,12 @@ components:
 - **Federated Training** – standard FedAvg orchestration with optional
   differential privacy (Gaussian noise + clipping) and secure aggregation.
 - **Forgetting** – remove a selected class from every client and continue
-  training or invoke an auxiliary logit-suppression procedure.
-- **Attacks** – infer the forgotten label using per-class accuracy deltas and
-  reconstruct representative samples by optimizing noise to reactivate the
-  removed class.
+  training, perform logit suppression, or reinitialise the classifier head for
+  the target class so that three distinct forgetting mechanisms can be
+  compared.
+- **Attacks** – infer the forgotten label using per-class accuracy, confusion,
+  and gradient-difference signals, and reconstruct representative samples via
+  gradient inversion or an optional diffusion generator.
 - **Reporting** – store reconstructed tensors, serialized models, and metadata
   summarizing attack success under different defense regimes.
 
@@ -27,16 +29,34 @@ python -m venv .venv
 source .venv/bin/activate
 pip install torch torchvision
 python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
-    --forget-rounds 3 --target-class 6 --reconstructions 4 --iid
+    --forget-rounds 3 --target-class 6 --reconstructions 4 --iid \
+    --forgetting-method classifier_reinit --reconstruction-method diffusion \
+    --diffusion-model-id runwayml/stable-diffusion-v1-5 --secure-aggregation bonawitz2017 \
+    --dp-sigma 0.8 --dp-mechanism laplace
 ```
 
 Outputs are stored in the `outputs/` directory (configurable through
 `--output`). Besides the reconstructed tensors and attack report, the pipeline
 logs baseline/post-forgetting accuracies and inferred classes, and now exports
-two heatmaps (`heatmap_accuracy_delta_<dataset>.png` 与
-`heatmap_confusion_delta_<dataset>.png`) that visualise the per-class accuracy
-变化以及混淆矩阵差值。默认使用 Matplotlib 的 `coolwarm` 色图，可通过
-`--heatmap-cmap` 修改；若不希望生成热力图，可追加 `--no-heatmaps`。
+three heatmaps (`heatmap_accuracy_delta_<dataset>.png`、
+`heatmap_confusion_delta_<dataset>.png`、`heatmap_gradient_delta_<dataset>.png`)
+that visualise the per-class accuracy 变化、混淆矩阵差值以及梯度范数差异。默认使用
+Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希望生成热力图，
+可追加 `--no-heatmaps`。
+
+常用命令行开关说明：
+
+- `--forgetting-method`：在 `fine_tune`、`logit_suppression`、`classifier_reinit`
+  三种遗忘策略之间切换。
+- `--reconstruction-method`：选择 `gradient` 或 `diffusion` 重建方式。若使用
+  扩散模型，可配合 `--diffusion-model-id`、`--diffusion-guidance`、
+  `--diffusion-steps` 与 `--diffusion-negative-prompt` 微调生成质量。
+- `--secure-aggregation`：模拟不同的安全聚合协议
+  （`bonawitz2017`、`shamir`、`homomorphic`）。
+- `--dp-sigma`、`--dp-mechanism` 与 `--dp-clip`：控制差分隐私噪声强度与分布
+  （Gaussian/Laplace/Student-t），用于评估攻击在不同隐私级别下的鲁棒性。
+- `--gradient-batches` 与 `--gradient-params`：指定梯度差分统计所用的数据
+  批次数以及关注的参数子串，从而影响生成的梯度热力图。
 
 ## Project structure
 
