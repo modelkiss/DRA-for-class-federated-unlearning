@@ -31,7 +31,11 @@ python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
 
 Outputs are stored in the `outputs/` directory (configurable through
 `--output`). Besides the reconstructed tensors and attack report, the pipeline
-logs baseline and post-forgetting accuracies together with the inferred class.
+logs baseline/post-forgetting accuracies and inferred classes, and now exports
+two heatmaps (`heatmap_accuracy_delta_<dataset>.png` 与
+`heatmap_confusion_delta_<dataset>.png`) that visualise the per-class accuracy
+变化以及混淆矩阵差值。默认使用 Matplotlib 的 `coolwarm` 色图，可通过
+`--heatmap-cmap` 修改；若不希望生成热力图，可追加 `--no-heatmaps`。
 
 ## Project structure
 

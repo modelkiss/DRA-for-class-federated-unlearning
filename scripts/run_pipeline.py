@@ -11,7 +11,7 @@ from typing import Dict, Sequence
 import torch
 
 from src.attacks.data_reconstruction import GradientReconstructor, ReconstructionConfig
-from src.attacks.label_inference import infer_forgotten_label
+from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.federated.client import Client, ClientConfig
 from src.federated.fedavg import FederatedServer, ServerConfig
@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-tv", type=float, default=1e-4)
     parser.add_argument("--forgetting-method", default="fine_tune", choices=["fine_tune", "logit_suppression"])
     parser.add_argument("--device", default=None, help="Torch device override")
+    parser.add_argument("--no-heatmaps", action="store_true", help="Disable exporting heatmap visualisations")
+    parser.add_argument(
+        "--heatmap-cmap",
+        default="coolwarm",
+        help="Matplotlib colormap name used when rendering heatmaps",
+    )
     return parser.parse_args()
 
 
@@ -165,9 +171,21 @@ def main() -> None:
         "dp_sigma": args.dp_sigma,
         "dp_clip": args.dp_clip,
         "secure_aggregation": args.secure_aggregation,
+        "heatmaps": {
+            "enabled": not args.no_heatmaps,
+            "cmap": args.heatmap_cmap,
+        },
     }
     with (args.output / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
+
+    if not args.no_heatmaps:
+        export_heatmaps(
+            inference,
+            output_dir=args.output,
+            cmap=args.heatmap_cmap,
+            dataset=args.dataset,
+        )
 
     LOGGER.info("Saved %d reconstructed samples and inference metadata to %s", len(reconstructions), args.output)
 
@@ -190,6 +208,66 @@ def perform_forgetting(
         method=method,
         input_shape=input_shape,
     )
+
+
+def export_heatmaps(
+    inference: LabelInferenceResult,
+    output_dir: Path,
+    cmap: str,
+    dataset: str,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        LOGGER.warning("Matplotlib is not available, skipping heatmap export: %s", exc)
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    num_classes = inference.per_class_before.numel()
+    class_indices = list(range(num_classes))
+
+    # Per-class accuracy differences
+    acc_diff = (
+        inference.per_class_before - inference.per_class_after
+    ).unsqueeze(0).detach().cpu().numpy()
+    fig, ax = plt.subplots(figsize=(max(6, num_classes * 0.6), 2.5))
+    im = ax.imshow(acc_diff, cmap=cmap, aspect="auto")
+    ax.set_title(f"Per-class accuracy delta ({dataset})")
+    ax.set_yticks([0])
+    ax.set_yticklabels(["Δ Acc"])
+    ax.set_xticks(class_indices)
+    ax.set_xticklabels(class_indices, rotation=45)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    per_class_path = output_dir / f"heatmap_accuracy_delta_{dataset}.png"
+    fig.savefig(per_class_path, dpi=200)
+    plt.close(fig)
+    LOGGER.info("Saved per-class heatmap to %s using cmap=%s", per_class_path, cmap)
+
+    # Confusion matrix differences
+    conf_diff = (
+        inference.confusion_before - inference.confusion_after
+    ).detach().cpu().numpy()
+    fig, ax = plt.subplots(figsize=(max(6, num_classes * 0.6), max(6, num_classes * 0.6)))
+    im = ax.imshow(conf_diff, cmap=cmap)
+    ax.set_title(f"Confusion matrix delta ({dataset})")
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("True class")
+    ax.set_xticks(class_indices)
+    ax.set_xticklabels(class_indices, rotation=90)
+    ax.set_yticks(class_indices)
+    ax.set_yticklabels(class_indices)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    confusion_path = output_dir / f"heatmap_confusion_delta_{dataset}.png"
+    fig.savefig(confusion_path, dpi=200)
+    plt.close(fig)
+    LOGGER.info("Saved confusion heatmap to %s using cmap=%s", confusion_path, cmap)
 
 
 if __name__ == "__main__":
