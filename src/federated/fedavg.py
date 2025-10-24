@@ -22,7 +22,8 @@ class ServerConfig:
     fraction: float = 1.0
     dp_sigma: float | None = None
     dp_clip: float | None = None
-    secure_aggregation: bool = False
+    dp_mechanism: str = "gaussian"
+    secure_aggregation: str | None = None
     seed: int = 0
 
 
@@ -93,13 +94,28 @@ class FederatedServer:
                 aggregated[name] += (global_state[name] + diff * clip_factor) * weight
 
         if self.config.dp_sigma is not None and self.config.dp_sigma > 0:
-            LOGGER.info("Applying Gaussian noise with sigma=%.4f", self.config.dp_sigma)
+            mechanism = self.config.dp_mechanism.lower()
+            LOGGER.info(
+                "Applying %s noise with scale=%.4f", mechanism.capitalize(), self.config.dp_sigma
+            )
             for name, tensor in aggregated.items():
-                noise = torch.normal(0.0, self.config.dp_sigma, size=tensor.shape)
+                if mechanism == "gaussian":
+                    noise = torch.normal(0.0, self.config.dp_sigma, size=tensor.shape)
+                elif mechanism == "laplace":
+                    distribution = torch.distributions.Laplace(0.0, self.config.dp_sigma)
+                    noise = distribution.sample(tensor.shape)
+                elif mechanism == "student":
+                    distribution = torch.distributions.StudentT(df=4.0)
+                    noise = distribution.sample(tensor.shape) * self.config.dp_sigma
+                else:
+                    raise ValueError(f"Unsupported DP mechanism: {self.config.dp_mechanism}")
                 aggregated[name] = tensor + noise.to(tensor.device)
 
-        if self.config.secure_aggregation:
-            LOGGER.info("Secure aggregation enabled: only aggregated model is revealed")
+        if self.config.secure_aggregation not in (None, "none"):
+            LOGGER.info(
+                "Secure aggregation enabled using '%s'; only aggregated model is revealed",
+                self.config.secure_aggregation,
+            )
         return aggregated
 
     def train(self, num_rounds: int) -> nn.Module:

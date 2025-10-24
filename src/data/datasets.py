@@ -113,6 +113,7 @@ class FederatedDataset:
     train_loaders: Dict[int, DataLoader]
     test_loader: DataLoader
     num_classes: int
+    class_names: Sequence[str] | None = None
 
     def remove_class(self, target_class: int) -> None:
         """Filter out all examples of ``target_class`` from each client's loader."""
@@ -169,7 +170,16 @@ def create_federated_dataloaders(config: FederatedDataConfig) -> FederatedDatase
         pin_memory=True,
     )
 
-    return FederatedDataset(train_loaders=train_loaders, test_loader=test_loader, num_classes=num_classes)
+    class_names = getattr(train_dataset, "classes", None)
+    if class_names is not None:
+        class_names = list(class_names)
+
+    return FederatedDataset(
+        train_loaders=train_loaders,
+        test_loader=test_loader,
+        num_classes=num_classes,
+        class_names=class_names,
+    )
 
 
 __all__ = [
