@@ -198,13 +198,34 @@ def main() -> None:
 
     LOGGER.info("Loading reconstructions from %s", args.reconstructions)
     reconstructions = load_reconstructions(args.reconstructions)
-    LOGGER.info("Loaded %d samples", reconstructions.shape[0])
+    LOGGER.info(
+        "Loaded %d samples with shape CxHxW=%s", reconstructions.shape[0], reconstructions.shape[1:]
+    )
 
     stats = NORMALIZATION_STATS[dataset]
     images = denormalize(reconstructions, stats).clamp(0.0, 1.0)
 
     args.output.mkdir(parents=True, exist_ok=True)
     prefix = determine_prefix(args, inference_metadata)
+    if inference_metadata is None:
+        LOGGER.info(
+            "No inference metadata supplied; using '%s' as the filename prefix.",
+            prefix,
+        )
+    else:
+        predicted = inference_metadata.get("predicted_class")
+        ground_truth = inference_metadata.get("ground_truth")
+        if predicted is None:
+            LOGGER.info("Inference metadata provided without a predicted class; using prefix '%s'", prefix)
+        elif ground_truth is None or int(predicted) == int(ground_truth):
+            LOGGER.info("Using predicted class %s as the filename prefix.", predicted)
+        else:
+            LOGGER.info(
+                "Predicted class %s differs from recorded ground-truth %s; prefix '%s' encodes both.",
+                predicted,
+                ground_truth,
+                prefix,
+            )
 
     LOGGER.info("Saving images to %s with prefix '%s'", args.output, prefix)
     for idx, image in enumerate(images, start=args.start_index):

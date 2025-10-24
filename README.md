@@ -65,11 +65,22 @@ python scripts/export_reconstructions.py \
     --output outputs/reconstructed_images --grid
 ```
 
+快速操作步骤：
+
+1. 先运行 `scripts/run_pipeline.py`，确保 `outputs/` 目录中生成了
+   `reconstructed.pt`、`metrics.json` 以及 `inference.json`。
+2. 在同一目录下执行上述命令，脚本会自动反归一化张量并输出单张图片
+   与（若指定 `--grid`）拼图网格。
+3. 输出文件夹中默认包含 `class_<id>_000.png` 等文件名；若同时保存了
+   ground-truth 信息，则前缀会写成 `pred6_gt2` 以示区分。
+
 参数说明：
 
 - 若自动探测失败，可通过 `--dataset` 显式指定（可选值：`cifar10`、`cifar100`、
   `mnist`、`fashionmnist`）。
 - `--inference` 与 `--metadata` 默认指向 `outputs/` 目录下的 JSON，若路径不同需显式设置。
+- `--start-index` 可设定导出图片的起始编号；`--format` 支持 `png`、`jpg`、`jpeg`。
+- `--grid-columns` 控制拼图时每行图片数，适合与 `--grid` 搭配使用。
 
 The script automatically inverts the dataset normalisation and writes
 individual images such as `class_6_000.png`. If the inference metadata is
