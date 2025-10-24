@@ -1,0 +1,27 @@
+{
+  "dataset": "cifar10",
+  "num_clients": 10,
+  "rounds": 10,
+  "forget_rounds": 5,
+  "baseline_accuracy": 0.1022,
+  "post_accuracy": 0.1019,
+  "target_class": 5,
+  "predicted_class": 0,
+  "attack_success": false,
+  "dp_sigma": 0.8,
+  "dp_clip": null,
+  "dp_mechanism": "laplace",
+  "secure_aggregation": "bonawitz2017",
+  "reconstruction_method": "diffusion",
+  "class_label": "airplane",
+  "gradient_batches": 2,
+  "gradient_params": [
+    "classifier",
+    "fc"
+  ],
+  "diffusion_model_id": "runwayml/stable-diffusion-v1-5",
+  "heatmaps": {
+    "enabled": true,
+    "cmap": "coolwarm"
+  }
+}
