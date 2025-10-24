@@ -22,7 +22,8 @@ class ServerConfig:
     fraction: float = 1.0
     dp_sigma: float | None = None
     dp_clip: float | None = None
-    secure_aggregation: bool = False
+    dp_mechanism: str = "gaussian"
+    secure_aggregation: str | None = None
     seed: int = 0
 
 
@@ -48,7 +49,7 @@ class FederatedServer:
         random.seed(config.seed)
 
     def _select_clients(self) -> Sequence[Client]:
-        if self.config.fraction >= 1.0:
+        if self.config.fraction == 1.0:
             return self.clients
         num_selected = max(1, int(self.config.fraction * len(self.clients)))
         return random.sample(self.clients, num_selected)
@@ -56,8 +57,10 @@ class FederatedServer:
     def run_round(self) -> None:
         participants = self._select_clients()
         LOGGER.info("Running round with %d clients", len(participants))
+
         global_state = self.global_model.state_dict()
         updates: List[Tuple[OrderedDict[str, torch.Tensor], int]] = []
+
         for client in participants:
             client_model = copy.deepcopy(self.global_model)
             trained_model = client.train(client_model)
@@ -74,7 +77,7 @@ class FederatedServer:
         total_samples = sum(num_samples for _, num_samples in updates)
         aggregated: OrderedDict[str, torch.Tensor] = OrderedDict()
         for name, param in global_state.items():
-            aggregated[name] = torch.zeros_like(param)
+            aggregated[name] = param.clone()
 
         for state_dict, num_samples in updates:
             weight = num_samples / max(total_samples, 1)
@@ -90,16 +93,31 @@ class FederatedServer:
 
             for name, tensor in state_dict.items():
                 diff = tensor - global_state[name]
-                aggregated[name] += (global_state[name] + diff * clip_factor) * weight
+                aggregated[name] += (diff * clip_factor * weight).to(aggregated[name].dtype)
 
         if self.config.dp_sigma is not None and self.config.dp_sigma > 0:
-            LOGGER.info("Applying Gaussian noise with sigma=%.4f", self.config.dp_sigma)
+            mechanism = self.config.dp_mechanism.lower()
+            LOGGER.info(
+                "Applying %s noise with scale=%.4f", mechanism.capitalize(), self.config.dp_sigma
+            )
             for name, tensor in aggregated.items():
-                noise = torch.normal(0.0, self.config.dp_sigma, size=tensor.shape)
+                if mechanism == "gaussian":
+                    noise = torch.normal(0.0, self.config.dp_sigma, size=tensor.shape)
+                elif mechanism == "laplace":
+                    distribution = torch.distributions.Laplace(0.0, self.config.dp_sigma)
+                    noise = distribution.sample(tensor.shape)
+                elif mechanism == "student":
+                    distribution = torch.distributions.StudentT(df=4.0)
+                    noise = distribution.sample(tensor.shape) * self.config.dp_sigma
+                else:
+                    raise ValueError(f"Unsupported DP mechanism: {self.config.dp_mechanism}")
                 aggregated[name] = tensor + noise.to(tensor.device)
 
-        if self.config.secure_aggregation:
-            LOGGER.info("Secure aggregation enabled: only aggregated model is revealed")
+        if self.config.secure_aggregation not in (None, "none"):
+            LOGGER.info(
+                "Secure aggregation enabled using '%s'; only aggregated model is revealed",
+                self.config.secure_aggregation,
+            )
         return aggregated
 
     def train(self, num_rounds: int) -> nn.Module:

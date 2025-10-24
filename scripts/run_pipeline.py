@@ -9,8 +9,14 @@ from pathlib import Path
 from typing import Dict, Sequence
 
 import torch
+import torch.nn.functional as F
 
-from src.attacks.data_reconstruction import GradientReconstructor, ReconstructionConfig
+from src.attacks.data_reconstruction import (
+    DiffusionConfig,
+    DiffusionReconstructor,
+    GradientReconstructor,
+    ReconstructionConfig,
+)
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.federated.client import Client, ClientConfig
@@ -44,7 +50,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-class", type=int, default=0)
     parser.add_argument("--dp-sigma", type=float, default=0.0)
     parser.add_argument("--dp-clip", type=float, default=None)
-    parser.add_argument("--secure-aggregation", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--log-level", default="INFO")
@@ -54,13 +59,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-lr", type=float, default=0.1)
     parser.add_argument("--reconstruction-lambda", type=float, default=1.0)
     parser.add_argument("--reconstruction-tv", type=float, default=1e-4)
-    parser.add_argument("--forgetting-method", default="fine_tune", choices=["fine_tune", "logit_suppression"])
+    parser.add_argument(
+        "--forgetting-method",
+        default="fine_tune",
+        choices=["fine_tune", "logit_suppression", "classifier_reinit"],
+    )
+    parser.add_argument(
+        "--reconstruction-method",
+        default="gradient",
+        choices=["gradient", "diffusion"],
+    )
     parser.add_argument("--device", default=None, help="Torch device override")
     parser.add_argument("--no-heatmaps", action="store_true", help="Disable exporting heatmap visualisations")
     parser.add_argument(
         "--heatmap-cmap",
         default="coolwarm",
         help="Matplotlib colormap name used when rendering heatmaps",
+    )
+    parser.add_argument(
+        "--secure-aggregation",
+        default="none",
+        choices=["none", "bonawitz2017", "shamir", "homomorphic"],
+        help="Secure aggregation protocol to simulate.",
+    )
+    parser.add_argument(
+        "--dp-mechanism",
+        default="gaussian",
+        choices=["gaussian", "laplace", "student"],
+        help="Differential privacy noise distribution",
+    )
+    parser.add_argument(
+        "--gradient-batches",
+        type=int,
+        default=2,
+        help="Number of batches for gradient-difference estimation (0 to disable).",
+    )
+    parser.add_argument(
+        "--gradient-params",
+        default="classifier,fc",
+        help="Comma separated substrings for selecting parameters whose gradients are inspected.",
+    )
+    parser.add_argument(
+        "--diffusion-model-id",
+        default="runwayml/stable-diffusion-v1-5",
+        help="Pretrained diffusion pipeline identifier (diffusers).",
+    )
+    parser.add_argument(
+        "--diffusion-steps",
+        type=int,
+        default=40,
+        help="Number of inference steps for diffusion reconstruction.",
+    )
+    parser.add_argument(
+        "--diffusion-guidance",
+        type=float,
+        default=7.5,
+        help="Classifier-free guidance scale for diffusion reconstruction.",
+    )
+    parser.add_argument(
+        "--diffusion-negative-prompt",
+        default=None,
+        help="Optional negative prompt for diffusion sampling.",
     )
     return parser.parse_args()
 
@@ -88,7 +147,10 @@ def main() -> None:
         local_epochs=args.local_epochs,
         device=device,
     )
-    clients = [Client(client_id=i, dataloader=loader, config=client_config) for i, loader in federated_dataset.train_loaders.items()]
+    clients = [
+        Client(client_id=i, dataloader=loader, config=client_config)
+        for i, loader in federated_dataset.train_loaders.items()
+    ]
 
     server_config = ServerConfig(
         device=device,
@@ -96,6 +158,7 @@ def main() -> None:
         dp_sigma=args.dp_sigma if args.dp_sigma > 0 else None,
         dp_clip=args.dp_clip,
         secure_aggregation=args.secure_aggregation,
+        dp_mechanism=args.dp_mechanism,
     )
     server = FederatedServer(model=model, clients=clients, config=server_config)
 
@@ -120,6 +183,11 @@ def main() -> None:
     post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
     LOGGER.info("Accuracy after forgetting: %.4f", post_accuracy)
 
+    gradient_filter = None
+    if args.gradient_params:
+        tokens = [token.strip() for token in args.gradient_params.split(",") if token.strip()]
+        gradient_filter = tokens or None
+
     inference = infer_forgotten_label(
         before=pre_forgetting_model,
         after=post_forgetting_model,
@@ -127,25 +195,84 @@ def main() -> None:
         num_classes=federated_dataset.num_classes,
         device=device,
         ground_truth=args.target_class,
+        gradient_batches=args.gradient_batches if args.gradient_batches > 0 else None,
+        gradient_filter=gradient_filter,
     )
     LOGGER.info("Label inference prediction: %d (ground truth: %d)", inference.predicted_class, args.target_class)
+    if inference.gradient_delta is not None:
+        gradient_norms = {name: tensor.norm().item() for name, tensor in inference.gradient_delta.items()}
+        LOGGER.debug("Gradient delta norms: %s", gradient_norms)
 
-    reconstructor = GradientReconstructor(
-        ReconstructionConfig(
-            steps=args.reconstruction_steps,
-            lr=args.reconstruction_lr,
-            lambda_after=args.reconstruction_lambda,
-            total_variation=args.reconstruction_tv,
-            device=device,
+    class_label = None
+    if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
+        class_label = str(federated_dataset.class_names[inference.predicted_class])
+
+    if args.reconstruction_method == "gradient":
+        reconstructor = GradientReconstructor(
+            ReconstructionConfig(
+                steps=args.reconstruction_steps,
+                lr=args.reconstruction_lr,
+                lambda_after=args.reconstruction_lambda,
+                total_variation=args.reconstruction_tv,
+                device=device,
+            )
         )
-    )
-    reconstructions = reconstructor.reconstruct(
-        pre_forgetting_model,
-        post_forgetting_model,
-        target_class=inference.predicted_class,
-        num_samples=args.reconstructions,
-        input_shape=INPUT_SHAPES[args.dataset],
-    )
+        reconstructions = reconstructor.reconstruct(
+            pre_forgetting_model,
+            post_forgetting_model,
+            target_class=inference.predicted_class,
+            num_samples=args.reconstructions,
+            input_shape=INPUT_SHAPES[args.dataset],
+        )
+    else:
+        diffusion_config = DiffusionConfig(
+            model_id=args.diffusion_model_id,
+            guidance_scale=args.diffusion_guidance,
+            num_inference_steps=args.diffusion_steps,
+            device=device,
+            negative_prompt=args.diffusion_negative_prompt,
+        )
+        try:
+            diffusion = DiffusionReconstructor(diffusion_config)
+            reconstructions = diffusion.reconstruct(
+                target_class=inference.predicted_class,
+                num_samples=args.reconstructions,
+                class_label=class_label,
+            )
+        except RuntimeError as exc:
+            LOGGER.error("Diffusion reconstruction failed: %s", exc)
+            LOGGER.info("Falling back to gradient-based reconstruction")
+            reconstructor = GradientReconstructor(
+                ReconstructionConfig(
+                    steps=args.reconstruction_steps,
+                    lr=args.reconstruction_lr,
+                    lambda_after=args.reconstruction_lambda,
+                    total_variation=args.reconstruction_tv,
+                    device=device,
+                )
+            )
+            reconstructions = reconstructor.reconstruct(
+                pre_forgetting_model,
+                post_forgetting_model,
+                target_class=inference.predicted_class,
+                num_samples=args.reconstructions,
+                input_shape=INPUT_SHAPES[args.dataset],
+            )
+
+    # Ensure reconstruction tensor matches dataset channel/size when using diffusion models.
+    expected_shape = INPUT_SHAPES[args.dataset]
+    if reconstructions.shape[1:] != expected_shape:
+        LOGGER.debug(
+            "Resizing reconstructions from %s to expected shape %s", reconstructions.shape[1:], expected_shape
+        )
+        reconstructions = F.interpolate(
+            reconstructions,
+            size=expected_shape[1:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        if expected_shape[0] == 1 and reconstructions.shape[1] == 3:
+            reconstructions = reconstructions.mean(dim=1, keepdim=True)
 
     args.output.mkdir(parents=True, exist_ok=True)
     torch.save(reconstructions, args.output / "reconstructed.pt")
@@ -156,6 +283,15 @@ def main() -> None:
         },
         args.output / "models.pt",
     )
+    if inference.gradient_delta is not None:
+        torch.save(
+            {
+                "before": inference.gradient_before,
+                "after": inference.gradient_after,
+                "delta": inference.gradient_delta,
+            },
+            args.output / "gradient_deltas.pt",
+        )
     with (args.output / "inference.json").open("w", encoding="utf-8") as handle:
         json.dump(inference.to_dict(), handle, indent=2)
     metadata = {
@@ -170,7 +306,13 @@ def main() -> None:
         "attack_success": inference.predicted_class == args.target_class,
         "dp_sigma": args.dp_sigma,
         "dp_clip": args.dp_clip,
+        "dp_mechanism": args.dp_mechanism,
         "secure_aggregation": args.secure_aggregation,
+        "reconstruction_method": args.reconstruction_method,
+        "class_label": class_label,
+        "gradient_batches": args.gradient_batches,
+        "gradient_params": gradient_filter,
+        "diffusion_model_id": args.diffusion_model_id if args.reconstruction_method == "diffusion" else None,
         "heatmaps": {
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
@@ -185,6 +327,7 @@ def main() -> None:
             output_dir=args.output,
             cmap=args.heatmap_cmap,
             dataset=args.dataset,
+            gradient_filter=gradient_filter,
         )
 
     LOGGER.info("Saved %d reconstructed samples and inference metadata to %s", len(reconstructions), args.output)
@@ -215,6 +358,8 @@ def export_heatmaps(
     output_dir: Path,
     cmap: str,
     dataset: str,
+    *,
+    gradient_filter: Sequence[str] | None = None,
 ) -> None:
     try:
         import matplotlib
@@ -240,10 +385,7 @@ def export_heatmaps(
     ax.set_title(f"Per-class accuracy delta ({dataset})")
     ax.set_yticks([0])
     ax.set_yticklabels(["Δ Acc"])
-    ax.set_xticks(class_indices)
-    ax.set_xticklabels(class_indices, rotation=45)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
+
     per_class_path = output_dir / f"heatmap_accuracy_delta_{dataset}.png"
     fig.savefig(per_class_path, dpi=200)
     plt.close(fig)
@@ -268,6 +410,25 @@ def export_heatmaps(
     fig.savefig(confusion_path, dpi=200)
     plt.close(fig)
     LOGGER.info("Saved confusion heatmap to %s using cmap=%s", confusion_path, cmap)
+
+    if inference.gradient_delta is not None:
+        names = list(inference.gradient_delta.keys())
+        norms = [tensor.norm().item() for tensor in inference.gradient_delta.values()]
+        fig, ax = plt.subplots(figsize=(max(6, len(names) * 0.6), 3))
+        ax.imshow(torch.tensor(norms).unsqueeze(0), cmap=cmap, aspect="auto")
+        ax.set_title("Gradient delta norms")
+        ax.set_yticks([0])
+        label = "Δ‖∇‖"
+        if gradient_filter:
+            label += f" ({', '.join(gradient_filter)})"
+        ax.set_yticklabels([label])
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, rotation=45, ha="right")
+        fig.tight_layout()
+        gradient_path = output_dir / f"heatmap_gradient_delta_{dataset}.png"
+        fig.savefig(gradient_path, dpi=200)
+        plt.close(fig)
+        LOGGER.info("Saved gradient delta heatmap to %s using cmap=%s", gradient_path, cmap)
 
 
 if __name__ == "__main__":

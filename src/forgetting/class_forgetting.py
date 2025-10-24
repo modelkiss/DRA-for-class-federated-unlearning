@@ -63,6 +63,12 @@ def forget_class(
             steps=200,
             device=client_config.device,
         )
+    elif method == "classifier_reinit":
+        LOGGER.info("Reinitialising classifier weights for class %d", target_class)
+        reinitialize_classifier_head(server.global_model, target_class)
+        if rounds > 0:
+            LOGGER.info("Stabilising classifier via %d fine-tuning rounds", rounds)
+            server.train(rounds)
     else:
         raise ValueError(f"Unknown forgetting method: {method}")
 
@@ -99,5 +105,35 @@ def suppress_class_logits(
             LOGGER.debug("Suppression step %d/%d (loss=%.4f)", step + 1, steps, loss.item())
     model.cpu()
 
+def reinitialize_classifier_head(model: nn.Module, target_class: int) -> None:
+    """Randomly reinitialise the final layer weights for ``target_class``."""
 
-__all__ = ["forget_class", "ForgettingResult", "suppress_class_logits", "reinitialize_clients"]
+    classifier: nn.Linear | None = None
+    for module in reversed(list(model.modules())):
+        if isinstance(module, nn.Linear):
+            classifier = module
+            break
+
+    if classifier is None:
+        raise RuntimeError("Unable to locate a linear classifier head in the model")
+
+    if target_class >= classifier.out_features:
+        raise ValueError(
+            f"Target class {target_class} exceeds classifier output dim {classifier.out_features}"
+        )
+
+    with torch.no_grad():
+        nn.init.kaiming_uniform_(classifier.weight[target_class : target_class + 1], a=5 ** 0.5)
+        if classifier.bias is not None:
+            classifier.bias[target_class].zero_()
+
+
+
+__all__ = [
+    "forget_class",
+    "ForgettingResult",
+    "suppress_class_logits",
+    "reinitialize_clients",
+    "reinitialize_classifier_head",
+]
+
