@@ -10,15 +10,13 @@ from typing import Iterable, Tuple
 import torch
 from torchvision.utils import save_image
 
-LOGGER = logging.getLogger(__name__)
+from src.utils.normalization import (
+    NORMALIZATION_STATS,
+    denormalize,
+    get_normalization_stats,
+)
 
-# Normalization statistics mirror the preprocessing used during training.
-NORMALIZATION_STATS = {
-    "cifar10": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    "cifar100": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    "mnist": ((0.1307,), (0.3081,)),
-    "fashionmnist": ((0.1307,), (0.3081,)),
-}
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -131,13 +129,6 @@ def _ensure_tensor(value: torch.Tensor | Iterable[float]) -> torch.Tensor:
     return torch.tensor(value, dtype=torch.float32)
 
 
-def denormalize(tensor: torch.Tensor, stats: Tuple[Tuple[float, ...], Tuple[float, ...]]) -> torch.Tensor:
-    mean, std = stats
-    mean_tensor = torch.tensor(mean, dtype=tensor.dtype).view(1, -1, 1, 1)
-    std_tensor = torch.tensor(std, dtype=tensor.dtype).view(1, -1, 1, 1)
-    return tensor * std_tensor + mean_tensor
-
-
 def determine_prefix(args: argparse.Namespace, metadata: dict | None) -> str:
     if args.prefix:
         return args.prefix
@@ -202,7 +193,7 @@ def main() -> None:
         "Loaded %d samples with shape CxHxW=%s", reconstructions.shape[0], reconstructions.shape[1:]
     )
 
-    stats = NORMALIZATION_STATS[dataset]
+    stats = get_normalization_stats(dataset)
     images = denormalize(reconstructions, stats).clamp(0.0, 1.0)
 
     args.output.mkdir(parents=True, exist_ok=True)

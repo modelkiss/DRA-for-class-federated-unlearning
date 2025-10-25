@@ -10,6 +10,7 @@ from typing import Dict, Sequence
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Subset
 
 from src.attacks.data_reconstruction import (
     DiffusionConfig,
@@ -25,6 +26,7 @@ from src.forgetting.class_forgetting import ForgettingResult, forget_class
 from src.models.nets import build_model
 from src.utils.logging import setup_logging
 from src.utils.metrics import accuracy
+from src.utils.normalization import denormalize, get_normalization_stats
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +37,124 @@ INPUT_SHAPES: Dict[str, Sequence[int]] = {
     "mnist": (1, 28, 28),
     "fashionmnist": (1, 28, 28),
 }
+
+def _count_targets_in_dataset(dataset, target_class: int) -> int:
+    """Count how many samples in ``dataset`` belong to ``target_class``."""
+
+    if isinstance(dataset, Subset):
+        parent = dataset.dataset
+        indices = dataset.indices
+        return sum(1 for idx in indices if int(parent[idx][1]) == target_class)
+
+    count = 0
+    for index in range(len(dataset)):
+        _, label = dataset[index]
+        if int(label) == target_class:
+            count += 1
+    return count
+
+
+def _normalize_heatmap(tensor: torch.Tensor) -> torch.Tensor:
+    """Scale saliency maps to the [0, 1] range per sample."""
+
+    flat = tensor.view(tensor.size(0), -1)
+    mins = flat.min(dim=1, keepdim=True).values.view(-1, 1, 1)
+    tensor = tensor - mins
+    flat = tensor.view(tensor.size(0), -1)
+    maxs = flat.max(dim=1, keepdim=True).values.view(-1, 1, 1)
+    safe_maxs = torch.where(maxs > 0, maxs, torch.ones_like(maxs))
+    return tensor / safe_maxs
+
+
+def _compute_saliency_maps(model: torch.nn.Module, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return gradient-based saliency maps and predicted classes."""
+
+    model.zero_grad(set_to_none=True)
+    inputs = inputs.clone().detach().requires_grad_(True)
+    outputs = model(inputs)
+    preds = outputs.argmax(dim=1)
+    selected = outputs.gather(1, preds.unsqueeze(1)).sum()
+    grads = torch.autograd.grad(selected, inputs, retain_graph=False)[0]
+    saliency = grads.abs().amax(dim=1, keepdim=False)
+    saliency = _normalize_heatmap(saliency)
+    return saliency.detach(), preds.detach()
+
+
+def _export_sample_heatmaps(
+    *,
+    dataloader,
+    model_before: torch.nn.Module,
+    model_after: torch.nn.Module,
+    output_dir: Path,
+    dataset: str,
+    cmap: str,
+    device: torch.device,
+    plt_module,
+) -> Path:
+    """Generate per-sample visualisations comparing saliency maps before/after forgetting."""
+
+    stats = get_normalization_stats(dataset)
+    sample_dir = output_dir / f"sample_heatmaps_{dataset}"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    model_before = model_before.to(device).eval()
+    model_after = model_after.to(device).eval()
+
+    total = 0
+    for batch_index, (inputs, targets) in enumerate(dataloader):
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        with torch.enable_grad():
+            before_maps, before_preds = _compute_saliency_maps(model_before, inputs)
+            after_maps, after_preds = _compute_saliency_maps(model_after, inputs)
+
+        diff_maps = before_maps - after_maps
+        originals = denormalize(inputs.detach().cpu(), stats).clamp(0.0, 1.0)
+        before_maps = before_maps.cpu()
+        after_maps = after_maps.cpu()
+        diff_maps = diff_maps.cpu()
+        before_preds = before_preds.cpu()
+        after_preds = after_preds.cpu()
+        targets_cpu = targets.detach().cpu()
+
+        for offset in range(inputs.size(0)):
+            figure_path = sample_dir / f"sample_{total:05d}.png"
+            fig, axes = plt_module.subplots(1, 4, figsize=(12, 3))
+            image = originals[offset].permute(1, 2, 0).numpy()
+            if image.shape[2] == 1:
+                axes[0].imshow(image[:, :, 0], cmap="gray", vmin=0.0, vmax=1.0)
+            else:
+                axes[0].imshow(image, vmin=0.0, vmax=1.0)
+            axes[0].set_title(f"原图\n标签={int(targets_cpu[offset])}")
+
+            axes[1].imshow(before_maps[offset].numpy(), cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[1].set_title(f"遗忘前热力图\n预测={int(before_preds[offset])}")
+
+            axes[2].imshow(after_maps[offset].numpy(), cmap=cmap, vmin=0.0, vmax=1.0)
+            axes[2].set_title(f"遗忘后热力图\n预测={int(after_preds[offset])}")
+
+            axes[3].imshow(diff_maps[offset].numpy(), cmap=cmap, vmin=-1.0, vmax=1.0)
+            axes[3].set_title("热力图差异")
+
+            for ax in axes:
+                ax.axis("off")
+
+            fig.suptitle(f"样本 {total}")
+            fig.tight_layout()
+            fig.savefig(figure_path, dpi=200)
+            plt_module.close(fig)
+            total += 1
+
+        LOGGER.debug(
+            "Processed batch %d/%d for per-sample热力图 (累计样本=%d)",
+            batch_index + 1,
+            len(dataloader),
+            total,
+        )
+
+    LOGGER.info("已为测试集生成 %d 张热力图对比图，保存在 %s", total, sample_dir)
+    return sample_dir
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +260,16 @@ def main() -> None:
     )
     federated_dataset = create_federated_dataloaders(federated_config)
 
+    target_sample_count = sum(
+        _count_targets_in_dataset(loader.dataset, args.target_class)
+        for loader in federated_dataset.train_loaders.values()
+    )
+    LOGGER.info(
+        "目标类别 %d 在遗忘前共有 %d 个样本（涵盖所有客户端）",
+        args.target_class,
+        target_sample_count,
+    )
+
     model = build_model(args.dataset, federated_dataset.num_classes)
 
     client_config = ClientConfig(
@@ -202,6 +332,27 @@ def main() -> None:
     if inference.gradient_delta is not None:
         gradient_norms = {name: tensor.norm().item() for name, tensor in inference.gradient_delta.items()}
         LOGGER.debug("Gradient delta norms: %s", gradient_norms)
+
+    per_class_records = []
+    for cls in range(federated_dataset.num_classes):
+        before_acc = float(inference.per_class_before[cls].item())
+        after_acc = float(inference.per_class_after[cls].item())
+        delta = before_acc - after_acc
+        LOGGER.info(
+            "类别 %d: 遗忘前 %.2f%%, 遗忘后 %.2f%%, 差值 %.2f%%",
+            cls,
+            before_acc * 100,
+            after_acc * 100,
+            delta * 100,
+        )
+        per_class_records.append(
+            {
+                "class": cls,
+                "before": before_acc,
+                "after": after_acc,
+                "delta": delta,
+            }
+        )
 
     class_label = None
     if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
@@ -302,6 +453,7 @@ def main() -> None:
         "baseline_accuracy": baseline_accuracy,
         "post_accuracy": post_accuracy,
         "target_class": args.target_class,
+        "target_class_sample_count": target_sample_count,
         "predicted_class": inference.predicted_class,
         "attack_success": inference.predicted_class == args.target_class,
         "dp_sigma": args.dp_sigma,
@@ -317,18 +469,28 @@ def main() -> None:
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
         },
+        "per_class_accuracy": per_class_records,
     }
-    with (args.output / "metrics.json").open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
 
     if not args.no_heatmaps:
-        export_heatmaps(
+        heatmap_artifacts = export_heatmaps(
             inference,
             output_dir=args.output,
             cmap=args.heatmap_cmap,
             dataset=args.dataset,
             gradient_filter=gradient_filter,
+            dataloader=federated_dataset.test_loader,
+            model_before=pre_forgetting_model,
+            model_after=post_forgetting_model,
+            device=device,
         )
+        metadata["heatmaps"].update(
+            {key: str(path) if path is not None else None for key, path in heatmap_artifacts.items()})
+    else:
+        heatmap_artifacts = {}
+
+    with (args.output / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
 
     LOGGER.info("Saved %d reconstructed samples and inference metadata to %s", len(reconstructions), args.output)
 
@@ -360,7 +522,11 @@ def export_heatmaps(
     dataset: str,
     *,
     gradient_filter: Sequence[str] | None = None,
-) -> None:
+ dataloader=None,
+    model_before: torch.nn.Module | None = None,
+    model_after: torch.nn.Module | None = None,
+    device: torch.device | None = None,
+) -> dict[str, Path | None]:
     try:
         import matplotlib
 
@@ -368,13 +534,14 @@ def export_heatmaps(
         import matplotlib.pyplot as plt
     except ImportError as exc:  # pragma: no cover - optional dependency
         LOGGER.warning("Matplotlib is not available, skipping heatmap export: %s", exc)
-        return
+    return {}
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     num_classes = inference.per_class_before.numel()
     class_indices = list(range(num_classes))
+    results: dict[str, Path | None] = {"per_class": None, "confusion": None, "gradient": None, "samples": None}
 
     # Per-class accuracy differences
     acc_diff = (
@@ -390,6 +557,7 @@ def export_heatmaps(
     fig.savefig(per_class_path, dpi=200)
     plt.close(fig)
     LOGGER.info("Saved per-class heatmap to %s using cmap=%s", per_class_path, cmap)
+    results["per_class"] = per_class_path
 
     # Confusion matrix differences
     conf_diff = (
@@ -410,6 +578,7 @@ def export_heatmaps(
     fig.savefig(confusion_path, dpi=200)
     plt.close(fig)
     LOGGER.info("Saved confusion heatmap to %s using cmap=%s", confusion_path, cmap)
+    results["confusion"] = confusion_path
 
     if inference.gradient_delta is not None:
         names = list(inference.gradient_delta.keys())
@@ -429,6 +598,21 @@ def export_heatmaps(
         fig.savefig(gradient_path, dpi=200)
         plt.close(fig)
         LOGGER.info("Saved gradient delta heatmap to %s using cmap=%s", gradient_path, cmap)
+        results["gradient"] = gradient_path
+
+    if dataloader is not None and model_before is not None and model_after is not None and device is not None:
+        results["samples"] = _export_sample_heatmaps(
+            dataloader=dataloader,
+            model_before=model_before,
+            model_after=model_after,
+            output_dir=output_dir,
+            dataset=dataset,
+            cmap=cmap,
+            device=device,
+            plt_module=plt,
+        )
+
+    return results
 
 
 if __name__ == "__main__":
