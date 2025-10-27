@@ -3,17 +3,18 @@
   "num_clients": 10,
   "rounds": 10,
   "forget_rounds": 5,
-  "baseline_accuracy": 0.1022,
-  "post_accuracy": 0.1019,
-  "target_class": 5,
-  "predicted_class": 0,
-  "attack_success": false,
-  "dp_sigma": 0.8,
+  "baseline_accuracy": 0.5305,
+  "post_accuracy": 0.5283,
+  "target_class": 6,
+  "target_class_sample_count": 5000,
+  "predicted_class": 6,
+  "attack_success": true,
+  "dp_sigma": 0.0,
   "dp_clip": null,
-  "dp_mechanism": "laplace",
-  "secure_aggregation": "bonawitz2017",
+  "dp_mechanism": "gaussian",
+  "secure_aggregation": "none",
   "reconstruction_method": "diffusion",
-  "class_label": "airplane",
+  "class_label": "frog",
   "gradient_batches": 2,
   "gradient_params": [
     "classifier",
@@ -23,5 +24,67 @@
   "heatmaps": {
     "enabled": true,
     "cmap": "coolwarm"
-  }
+  },
+  "per_class_accuracy": [
+    {
+      "class": 0,
+      "before": 0.6909999847412109,
+      "after": 0.5830000042915344,
+      "delta": 0.10799998044967651
+    },
+    {
+      "class": 1,
+      "before": 0.7110000252723694,
+      "after": 0.5640000104904175,
+      "delta": 0.1470000147819519
+    },
+    {
+      "class": 2,
+      "before": 0.40700000524520874,
+      "after": 0.4269999861717224,
+      "delta": -0.019999980926513672
+    },
+    {
+      "class": 3,
+      "before": 0.25200000405311584,
+      "after": 0.4269999861717224,
+      "delta": -0.17499998211860657
+    },
+    {
+      "class": 4,
+      "before": 0.36000001430511475,
+      "after": 0.527999997138977,
+      "delta": -0.1679999828338623
+    },
+    {
+      "class": 5,
+      "before": 0.6759999990463257,
+      "after": 0.6690000295639038,
+      "delta": 0.006999969482421875
+    },
+    {
+      "class": 6,
+      "before": 0.6159999966621399,
+      "after": 0.0,
+      "delta": 0.6159999966621399
+    },
+    {
+      "class": 7,
+      "before": 0.5149999856948853,
+      "after": 0.5630000233650208,
+      "delta": -0.0480000376701355
+    },
+    {
+      "class": 8,
+      "before": 0.6079999804496765,
+      "after": 0.8109999895095825,
+      "delta": -0.203000009059906
+    },
+    {
+      "class": 9,
+      "before": 0.4690000116825104,
+      "after": 0.7110000252723694,
+      "delta": -0.242000013589859
+    }
+  ]
 }
