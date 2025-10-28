@@ -22,7 +22,13 @@ from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_la
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.federated.client import Client, ClientConfig
 from src.federated.fedavg import FederatedServer, ServerConfig
-from src.forgetting.class_forgetting import ForgettingResult, forget_class
+from src.forgetting.class_forgetting import (
+    ForgettingResult,
+    FedEraserConfig,
+    FedAFConfig,
+    OneShotClassUnlearningConfig,
+    forget_class,
+)
 from src.models.nets import build_model
 from src.utils.logging import setup_logging
 from src.utils.metrics import accuracy
@@ -181,8 +187,99 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconstruction-tv", type=float, default=1e-4)
     parser.add_argument(
         "--forgetting-method",
-        default="fine_tune",
-        choices=["fine_tune", "logit_suppression", "classifier_reinit"],
+        default="fed_eraser",
+        choices=["fed_eraser", "fedaf", "one_shot"],
+        help="Class forgetting strategy applied after removing the target class.",
+    )
+    parser.add_argument(
+        "--fed-eraser-history",
+        type=int,
+        default=5,
+        help="FedEraser: number of recent calibration states retained for averaging.",
+    )
+    parser.add_argument(
+        "--fed-eraser-calibration-rounds",
+        type=int,
+        default=3,
+        help="FedEraser: number of calibration rounds performed after class removal.",
+    )
+    parser.add_argument(
+        "--fed-eraser-lr",
+        type=float,
+        default=5e-3,
+        help="FedEraser: calibration learning rate for participating clients.",
+    )
+    parser.add_argument(
+        "--fed-eraser-client-fraction",
+        type=float,
+        default=0.5,
+        help="FedEraser: fraction of clients sampled during calibration rounds.",
+    )
+    parser.add_argument(
+        "--fed-eraser-weight-decay",
+        type=float,
+        default=1e-4,
+        help="FedEraser: weight decay applied during calibration updates.",
+    )
+    parser.add_argument(
+        "--fedaf-lambda",
+        type=float,
+        default=0.25,
+        help="FedAF: forgetting regularisation weight λ.",
+    )
+    parser.add_argument(
+        "--fedaf-beta",
+        type=float,
+        default=0.2,
+        help="FedAF: retained knowledge constraint strength β.",
+    )
+    parser.add_argument(
+        "--fedaf-lr",
+        type=float,
+        default=1e-2,
+        help="FedAF: learning rate used during adaptive forgetting rounds.",
+    )
+    parser.add_argument(
+        "--fedaf-mask-ratio",
+        type=float,
+        default=0.3,
+        help="FedAF: ratio of target-class weights masked each round.",
+    )
+    parser.add_argument(
+        "--fedaf-stop-threshold",
+        type=float,
+        default=0.4,
+        help="FedAF: stop once the target-class weight norm drops by this ratio.",
+    )
+    parser.add_argument(
+        "--oneshot-projection-dim",
+        type=int,
+        default=16,
+        help="One-shot unlearning: projection subspace dimensionality.",
+    )
+    parser.add_argument(
+        "--oneshot-replacement-strength",
+        type=float,
+        default=0.5,
+        help="One-shot unlearning: noise strength injected into the target classifier weights.",
+    )
+    parser.add_argument(
+        "--oneshot-freeze-ratio",
+        type=float,
+        default=0.4,
+        help="One-shot unlearning: fraction of non-classifier parameters frozen during tuning.",
+    )
+    parser.add_argument(
+        "--oneshot-local-epochs",
+        type=int,
+        default=1,
+        help="One-shot unlearning: local fine-tuning epochs executed on each client.",
+    )
+    parser.add_argument(
+        "--oneshot-reconstruction-threshold",
+        type=float,
+        default=0.2,
+        help="One-shot unlearning: trigger an extra stabilisation round if below this reconstruction gap.",
     )
     parser.add_argument(
         "--reconstruction-method",
@@ -299,6 +396,31 @@ def main() -> None:
     baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
     LOGGER.info("Baseline accuracy before forgetting: %.4f", baseline_accuracy)
 
+    if args.forgetting_method == "fed_eraser":
+        method_config = FedEraserConfig(
+            history_window=args.fed_eraser_history,
+            calibration_rounds=args.fed_eraser_calibration_rounds,
+            calibration_lr=args.fed_eraser_lr,
+            calibration_client_fraction=args.fed_eraser_client_fraction,
+            update_weight_decay=args.fed_eraser_weight_decay,
+        )
+    elif args.forgetting_method == "fedaf":
+        method_config = FedAFConfig(
+            forgetting_regularization=args.fedaf_lambda,
+            retention_strength=args.fedaf_beta,
+            learning_rate=args.fedaf_lr,
+            class_mask_ratio=args.fedaf_mask_ratio,
+            stop_threshold=args.fedaf_stop_threshold,
+        )
+    else:
+        method_config = OneShotClassUnlearningConfig(
+            projection_dim=args.oneshot_projection_dim,
+            replacement_strength=args.oneshot_replacement_strength,
+            freeze_ratio=args.oneshot_freeze_ratio,
+            local_tuning_epochs=args.oneshot_local_epochs,
+            reconstruction_threshold=args.oneshot_reconstruction_threshold,
+        )
+
     forgetting_result = perform_forgetting(
         server=server,
         dataset=federated_dataset,
@@ -307,6 +429,7 @@ def main() -> None:
         rounds=args.forget_rounds,
         method=args.forgetting_method,
         input_shape=INPUT_SHAPES[args.dataset],
+        method_config=method_config,
     )
 
     post_forgetting_model = copy.deepcopy(server.global_model)
@@ -503,6 +626,7 @@ def perform_forgetting(
     rounds: int,
     method: str,
     input_shape: Sequence[int],
+    method_config: FedEraserConfig | FedAFConfig | OneShotClassUnlearningConfig,
 ) -> ForgettingResult:
     return forget_class(
         server=server,
@@ -512,6 +636,7 @@ def perform_forgetting(
         rounds=rounds,
         method=method,
         input_shape=input_shape,
+        method_config=method_config,
     )
 
 
