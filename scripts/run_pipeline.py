@@ -20,6 +20,7 @@ from src.attacks.data_reconstruction import (
 )
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
+from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.client import Client, ClientConfig
 from src.federated.fedavg import FederatedServer, ServerConfig
 from src.forgetting.class_forgetting import (
@@ -305,10 +306,142 @@ def parse_args() -> argparse.Namespace:
         help="Secure aggregation protocol to simulate.",
     )
     parser.add_argument(
-        "--dp-mechanism",
-        default="gaussian",
-        choices=["gaussian", "laplace", "student"],
-        help="Differential privacy noise distribution",
+        "--dp-method",
+        default="none",
+        choices=["none", "dp-sgd", "ldp-fl", "adaptive-dp-fl", "rdp-fl"],
+        help="Differential privacy strategy to enable during training.",
+    )
+    parser.add_argument(
+        "--dp-sgd-epsilon",
+        type=float,
+        default=1.0,
+        help="Target privacy budget ε for DP-SGD (central DP).",
+    )
+    parser.add_argument(
+        "--dp-sgd-delta",
+        type=float,
+        default=1e-5,
+        help="Confidence parameter δ for DP-SGD.",
+    )
+    parser.add_argument(
+        "--dp-sgd-noise",
+        type=float,
+        default=1.0,
+        help="Noise multiplier σ applied to aggregated updates in DP-SGD.",
+    )
+    parser.add_argument(
+        "--dp-sgd-clip",
+        type=float,
+        default=1.0,
+        help="Gradient clipping threshold C used by DP-SGD.",
+    )
+    parser.add_argument(
+        "--dp-sgd-sampling-prob",
+        type=float,
+        default=1.0,
+        help="Global sampling proportion q for DP-SGD.",
+    )
+    parser.add_argument(
+        "--ldp-noise-multiplier",
+        type=float,
+        default=1.0,
+        help="Per-client noise multiplier for LDP-FL.",
+    )
+    parser.add_argument(
+        "--ldp-clip",
+        type=float,
+        default=1.0,
+        help="Clipping norm applied to client updates under LDP-FL.",
+    )
+    parser.add_argument(
+        "--ldp-seed-consistency",
+        dest="ldp_seed_consistency",
+        action="store_true",
+        help="Use a consistent random seed across LDP-FL rounds.",
+    )
+    parser.set_defaults(ldp_seed_consistency=True)
+    parser.add_argument(
+        "--no-ldp-seed-consistency",
+        dest="ldp_seed_consistency",
+        action="store_false",
+        help="Disable deterministic noise for LDP-FL.",
+    )
+    parser.add_argument(
+        "--ldp-local-sampling-rate",
+        type=float,
+        default=1.0,
+        help="Client-side sampling rate for LDP-FL.",
+    )
+    parser.add_argument(
+        "--ldp-epsilon",
+        type=float,
+        default=1.0,
+        help="Local privacy budget ε for LDP-FL.",
+    )
+    parser.add_argument(
+        "--ldp-delta",
+        type=float,
+        default=1e-5,
+        help="Local privacy confidence δ for LDP-FL.",
+    )
+    parser.add_argument(
+        "--adaptive-dp-epsilon-fn",
+        default="1.0",
+        help="Expression describing adaptive ε allocation as a function of 'round' and 'total_rounds'.",
+    )
+    parser.add_argument(
+        "--adaptive-dp-clipping",
+        default="linear",
+        choices=["none", "linear", "exponential", "cosine"],
+        help="Adaptive clipping strategy for Adaptive DP-FL.",
+    )
+    parser.add_argument(
+        "--adaptive-dp-noise-growth",
+        type=float,
+        default=0.5,
+        help="Noise growth rate controlling σ progression in Adaptive DP-FL.",
+    )
+    parser.add_argument(
+        "--adaptive-dp-max-rounds",
+        type=int,
+        default=100,
+        help="Maximum rounds permitted under Adaptive DP-FL before disabling noise.",
+    )
+    parser.add_argument(
+        "--adaptive-dp-budget-decay",
+        type=float,
+        default=0.1,
+        help="Budget decay coefficient applied to Adaptive DP-FL clipping/noise.",
+    )
+    parser.add_argument(
+        "--rdp-order",
+        type=float,
+        default=2.0,
+        help="Rényi order α for RDP-FL accounting.",
+    )
+    parser.add_argument(
+        "--rdp-epsilon-rule",
+        default="additive",
+        choices=["additive", "max", "window"],
+        help="Accumulation rule for ε under RDP-FL.",
+    )
+    parser.add_argument(
+        "--rdp-noise-multiplier",
+        type=float,
+        default=1.0,
+        help="Noise multiplier applied each round in RDP-FL.",
+    )
+    parser.add_argument(
+        "--rdp-clip",
+        type=float,
+        default=1.0,
+        help="Clipping threshold for RDP-FL updates.",
+    )
+    parser.add_argument(
+        "--rdp-accounting-window",
+        type=int,
+        default=10,
+        help="Number of recent rounds considered in windowed RDP-FL accounting.",
     )
     parser.add_argument(
         "--gradient-batches",
@@ -384,13 +517,48 @@ def main() -> None:
         for i, loader in federated_dataset.train_loaders.items()
     ]
 
+    dp_parameters: dict[str, float | int | str | bool] = {}
+    if args.dp_method == "dp-sgd":
+        dp_parameters = {
+            "epsilon": args.dp_sgd_epsilon,
+            "delta": args.dp_sgd_delta,
+            "noise_multiplier": args.dp_sgd_noise,
+            "clip": args.dp_sgd_clip,
+            "sampling_probability": args.dp_sgd_sampling_prob,
+        }
+    elif args.dp_method == "ldp-fl":
+        dp_parameters = {
+            "per_client_noise_multiplier": args.ldp_noise_multiplier,
+            "clipping_norm": args.ldp_clip,
+            "seed_consistency": args.ldp_seed_consistency,
+            "local_sampling_rate": args.ldp_local_sampling_rate,
+            "epsilon": args.ldp_epsilon,
+            "delta": args.ldp_delta,
+        }
+    elif args.dp_method == "adaptive-dp-fl":
+        dp_parameters = {
+            "epsilon_expression": args.adaptive_dp_epsilon_fn,
+            "adaptive_clipping": args.adaptive_dp_clipping,
+            "noise_growth_rate": args.adaptive_dp_noise_growth,
+            "max_rounds": args.adaptive_dp_max_rounds,
+            "budget_decay": args.adaptive_dp_budget_decay,
+        }
+    elif args.dp_method == "rdp-fl":
+        dp_parameters = {
+            "renyi_order": args.rdp_order,
+            "epsilon_accumulation": args.rdp_epsilon_rule,
+            "noise_multiplier": args.rdp_noise_multiplier,
+            "clip": args.rdp_clip,
+            "accounting_window": args.rdp_accounting_window,
+        }
+
+    dp_config = DifferentialPrivacyConfig(method=args.dp_method, parameters=dp_parameters)
+
     server_config = ServerConfig(
         device=device,
         fraction=args.fraction,
-        dp_sigma=args.dp_sigma if args.dp_sigma > 0 else None,
-        dp_clip=args.dp_clip,
+        dp_config=dp_config,
         secure_aggregation=args.secure_aggregation,
-        dp_mechanism=args.dp_mechanism,
     )
     server = FederatedServer(model=model, clients=clients, config=server_config)
 
@@ -584,9 +752,8 @@ def main() -> None:
         "target_class_sample_count": target_sample_count,
         "predicted_class": inference.predicted_class,
         "attack_success": inference.predicted_class == args.target_class,
-        "dp_sigma": args.dp_sigma,
-        "dp_clip": args.dp_clip,
-        "dp_mechanism": args.dp_mechanism,
+        "dp_method": args.dp_method,
+        "dp_parameters": dp_parameters,
         "secure_aggregation": args.secure_aggregation,
         "reconstruction_method": args.reconstruction_method,
         "class_label": class_label,
