@@ -140,7 +140,10 @@ def _average_state_dicts(states: Iterable[MutableMapping[str, torch.Tensor]]) ->
     averaged: OrderedDict[str, torch.Tensor] = OrderedDict()
     for key in states[0].keys():
         stacked = torch.stack([state[key] for state in states])
-        averaged[key] = stacked.mean(dim=0)
+        if stacked.dtype in (torch.float16, torch.float32, torch.float64):
+            averaged[key] = stacked.mean(dim=0)
+        else:
+            averaged[key] = stacked[0]
     return averaged
 
 
