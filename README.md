@@ -12,10 +12,9 @@ components:
   with a factory that can be extended to ResNet-style models.
 - **Federated Training** – standard FedAvg orchestration with optional
   differential privacy (Gaussian noise + clipping) and secure aggregation.
-- **Forgetting** – remove a selected class from every client and continue
-training, perform logit suppression, or reinitialise the classifier head for
-  the target class so that three distinct forgetting mechanisms can be
-  compared.
+**Forgetting** – remove a selected class from every client and apply
+  FedEraser calibration, adaptive FedAF optimisation, or one-shot classifier
+  surgery so that three distinct forgetting mechanisms can be compared.
 - **Attacks** – infer the forgotten label using per-class accuracy, confusion,
   and gradient-difference signals, and reconstruct representative samples via
   gradient inversion or an optional diffusion generator.
@@ -29,8 +28,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install torch torchvision
 python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
-   --forget-rounds 3 --target-class 6 --reconstructions 4 --iid \
-    --forgetting-method classifier_reinit --reconstruction-method diffusion \
+    --target-class 6 --reconstructions 4 --iid \
+    --forgetting-method fedaf --fedaf-rounds 3 --reconstruction-method diffusion \
     --diffusion-model-id runwayml/stable-diffusion-v1-5 --secure-aggregation bonawitz2017 \
     --dp-sigma 0.8 --dp-mechanism laplace
 ```
@@ -46,8 +45,7 @@ Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希
 
 常用命令行开关说明：
 
-- `--forgetting-method`：在 `fine_tune`、`logit_suppression`、`classifier_reinit`
-  三种遗忘策略之间切换。
+- `--forgetting-method`：在 `fed_eraser`、`fedaf`、`one_shot` 三种遗忘策略之间切换。
 - `--reconstruction-method`：选择 `gradient` 或 `diffusion` 重建方式。若使用
   扩散模型，可配合 `--diffusion-model-id`、`--diffusion-guidance`、
   `--diffusion-steps` 与 `--diffusion-negative-prompt` 微调生成质量。

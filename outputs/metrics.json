@@ -2,7 +2,7 @@
   "dataset": "cifar100",
   "num_clients": 10,
   "rounds": 20,
-  "forget_rounds": 3,
+  "fedaf_rounds": 5,
   "baseline_accuracy": 0.2194,
   "post_accuracy": 0.2371,
   "target_class": 10,

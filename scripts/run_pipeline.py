@@ -168,7 +168,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="cifar10", choices=INPUT_SHAPES.keys())
     parser.add_argument("--num-clients", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=5, help="Number of pre-forgetting federated rounds")
-    parser.add_argument("--forget-rounds", type=int, default=3, help="Rounds after removing the target class")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--iid", action="store_true", help="Use IID data partitioning")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.5)
@@ -250,6 +249,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.4,
         help="FedAF: stop once the target-class weight norm drops by this ratio.",
+    )
+    parser.add_argument(
+        "--fedaf-rounds",
+        type=int,
+        default=3,
+        help="FedAF: maximum number of adaptive forgetting rounds.",
     )
     parser.add_argument(
         "--oneshot-projection-dim",
@@ -411,6 +416,7 @@ def main() -> None:
             learning_rate=args.fedaf_lr,
             class_mask_ratio=args.fedaf_mask_ratio,
             stop_threshold=args.fedaf_stop_threshold,
+            optimisation_rounds=args.fedaf_rounds,
         )
     else:
         method_config = OneShotClassUnlearningConfig(
@@ -426,7 +432,6 @@ def main() -> None:
         dataset=federated_dataset,
         client_config=client_config,
         target_class=args.target_class,
-        rounds=args.forget_rounds,
         method=args.forgetting_method,
         input_shape=INPUT_SHAPES[args.dataset],
         method_config=method_config,
@@ -572,7 +577,7 @@ def main() -> None:
         "dataset": args.dataset,
         "num_clients": args.num_clients,
         "rounds": args.rounds,
-        "forget_rounds": args.forget_rounds,
+        "fedaf_rounds": args.fedaf_rounds if args.forgetting_method == "fedaf" else None,
         "baseline_accuracy": baseline_accuracy,
         "post_accuracy": post_accuracy,
         "target_class": args.target_class,
@@ -623,7 +628,6 @@ def perform_forgetting(
     dataset: FederatedDataset,
     client_config: ClientConfig,
     target_class: int,
-    rounds: int,
     method: str,
     input_shape: Sequence[int],
     method_config: FedEraserConfig | FedAFConfig | OneShotClassUnlearningConfig,
@@ -633,7 +637,6 @@ def perform_forgetting(
         dataset=dataset,
         client_config=client_config,
         target_class=target_class,
-        rounds=rounds,
         method=method,
         input_shape=input_shape,
         method_config=method_config,

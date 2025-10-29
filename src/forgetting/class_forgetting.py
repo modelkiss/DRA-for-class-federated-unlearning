@@ -40,6 +40,7 @@ class FedAFConfig:
     learning_rate: float = 1e-2
     class_mask_ratio: float = 0.3
     stop_threshold: float = 0.4
+    optimisation_rounds: int = 3
 
 
 @dataclass
@@ -71,7 +72,6 @@ def forget_class(
     dataset: FederatedDataset,
     client_config: ClientConfig,
     target_class: int,
-    rounds: int,
     method: str = "fed_eraser",
     input_shape: Sequence[int] | None = None,
     method_config: MethodConfig = None,
@@ -93,7 +93,6 @@ def forget_class(
             dataset,
             client_config,
             target_class=target_class,
-            rounds=rounds,
             original_state=original_state,
             config=config,  # type: ignore[arg-type]
         )
@@ -201,7 +200,6 @@ def _apply_fedaf(
         base_client_config: ClientConfig,
         *,
         target_class: int,
-        rounds: int,
         original_state: Dict[str, torch.Tensor],
         config: FedAFConfig,
 ) -> None:
@@ -222,7 +220,7 @@ def _apply_fedaf(
     baseline_bias = original_state.get(bias_key)
     baseline_norm = float(baseline_weights[target_class].norm().item())
 
-    max_rounds = max(1, rounds)
+    max_rounds = max(1, config.optimisation_rounds)
     stop_ratio = max(0.0, min(1.0, config.stop_threshold))
     mask_ratio = max(0.0, min(1.0, config.class_mask_ratio))
     retention = max(0.0, min(1.0, config.retention_strength))
