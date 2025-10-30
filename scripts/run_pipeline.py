@@ -13,12 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Subset
 
-from src.attacks.data_reconstruction import (
-    DiffusionConfig,
-    DiffusionReconstructor,
-    GradientReconstructor,
-    ReconstructionConfig,
-)
+from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
@@ -426,17 +421,11 @@ def parse_args() -> argparse.Namespace:
         help="FastSecAgg: encryption primitive applied to masked sums.",
     )
     parser.add_argument("--target-class", type=int, default=0)
-    parser.add_argument("--dp-sigma", type=float, default=0.0)
-    parser.add_argument("--dp-clip", type=float, default=None)
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--output", type=Path, default=Path("outputs"))
     parser.add_argument("--reconstructions", type=int, default=8)
-    parser.add_argument("--reconstruction-steps", type=int, default=400)
-    parser.add_argument("--reconstruction-lr", type=float, default=0.1)
-    parser.add_argument("--reconstruction-lambda", type=float, default=1.0)
-    parser.add_argument("--reconstruction-tv", type=float, default=1e-4)
     parser.add_argument(
         "--forgetting-method",
         default="fed_eraser",
@@ -538,11 +527,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="One-shot unlearning: trigger an extra stabilisation round if below this reconstruction gap.",
-    )
-    parser.add_argument(
-        "--reconstruction-method",
-        default="gradient",
-        choices=["gradient", "diffusion"],
     )
     parser.add_argument("--device", default=None, help="Torch device override")
     parser.add_argument("--no-heatmaps", action="store_true", help="Disable exporting heatmap visualisations")
@@ -906,57 +890,24 @@ def main() -> None:
     if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
         class_label = str(federated_dataset.class_names[inference.predicted_class])
 
-    if args.reconstruction_method == "gradient":
-        reconstructor = GradientReconstructor(
-            ReconstructionConfig(
-                steps=args.reconstruction_steps,
-                lr=args.reconstruction_lr,
-                lambda_after=args.reconstruction_lambda,
-                total_variation=args.reconstruction_tv,
-                device=device,
-            )
-        )
-        reconstructions = reconstructor.reconstruct(
-            pre_forgetting_model,
-            post_forgetting_model,
-            target_class=inference.predicted_class,
-            num_samples=args.reconstructions,
-            input_shape=INPUT_SHAPES[args.dataset],
-        )
-    else:
-        diffusion_config = DiffusionConfig(
-            model_id=args.diffusion_model_id,
-            guidance_scale=args.diffusion_guidance,
-            num_inference_steps=args.diffusion_steps,
-            device=device,
-            negative_prompt=args.diffusion_negative_prompt,
-        )
-        try:
-            diffusion = DiffusionReconstructor(diffusion_config)
-            reconstructions = diffusion.reconstruct(
-                target_class=inference.predicted_class,
-                num_samples=args.reconstructions,
-                class_label=class_label,
-            )
-        except RuntimeError as exc:
-            LOGGER.error("Diffusion reconstruction failed: %s", exc)
-            LOGGER.info("Falling back to gradient-based reconstruction")
-            reconstructor = GradientReconstructor(
-                ReconstructionConfig(
-                    steps=args.reconstruction_steps,
-                    lr=args.reconstruction_lr,
-                    lambda_after=args.reconstruction_lambda,
-                    total_variation=args.reconstruction_tv,
-                    device=device,
-                )
-            )
-            reconstructions = reconstructor.reconstruct(
-                pre_forgetting_model,
-                post_forgetting_model,
-                target_class=inference.predicted_class,
-                num_samples=args.reconstructions,
-                input_shape=INPUT_SHAPES[args.dataset],
-            )
+    diffusion_config = DiffusionConfig(
+        model_id=args.diffusion_model_id,
+        guidance_scale=args.diffusion_guidance,
+        num_inference_steps=args.diffusion_steps,
+        device=device,
+        negative_prompt=args.diffusion_negative_prompt,
+    )
+    try:
+        diffusion = DiffusionReconstructor(diffusion_config)
+    except RuntimeError as exc:
+        LOGGER.error("Diffusion reconstruction failed: %s", exc)
+        raise SystemExit("Diffusion-based reconstruction requires the 'diffusers' package") from exc
+
+    reconstructions = diffusion.reconstruct(
+        target_class=inference.predicted_class,
+        num_samples=args.reconstructions,
+        class_label=class_label,
+    )
 
     # Ensure reconstruction tensor matches dataset channel/size when using diffusion models.
     expected_shape = INPUT_SHAPES[args.dataset]
@@ -975,6 +926,8 @@ def main() -> None:
 
     args.output.mkdir(parents=True, exist_ok=True)
     torch.save(reconstructions, args.output / "reconstructed.pt")
+    torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
+    torch.save(post_forgetting_model.state_dict(), args.output / "model_after.pt")
     torch.save(
         {
             "original": forgetting_result.original_state,
@@ -1009,12 +962,12 @@ def main() -> None:
         "aggregation": {
             "mechanism": aggregation.mechanism,
             "parameters": aggregation.parameters,
+            "is_secure": server.aggregator.is_secure,
         },
-        "reconstruction_method": args.reconstruction_method,
         "class_label": class_label,
         "gradient_batches": args.gradient_batches,
         "gradient_params": gradient_filter,
-        "diffusion_model_id": args.diffusion_model_id if args.reconstruction_method == "diffusion" else None,
+        "diffusion_model_id": args.diffusion_model_id,
         "heatmaps": {
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
@@ -1084,7 +1037,7 @@ def export_heatmaps(
         import matplotlib.pyplot as plt
     except ImportError as exc:  # pragma: no cover - optional dependency
         LOGGER.warning("Matplotlib is not available, skipping heatmap export: %s", exc)
-    return {}
+        return {}
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

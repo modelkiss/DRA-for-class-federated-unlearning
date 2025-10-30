@@ -18,8 +18,8 @@ components:
   FedEraser calibration, adaptive FedAF optimisation, or one-shot classifier
   surgery so that three distinct forgetting mechanisms can be compared.
 - **Attacks** – infer the forgotten label using per-class accuracy, confusion,
-  and gradient-difference signals, and reconstruct representative samples via
-  gradient inversion or an optional diffusion generator.
+  and gradient-difference signals, and reconstruct representative samples with
+  a text-to-image diffusion generator.
 - **Reporting** – store reconstructed tensors, serialized models, and metadata
   summarizing attack success under different defense regimes.
 
@@ -28,11 +28,11 @@ components:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install torch torchvision
+pip install torch torchvision diffusers
 python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
     --target-class 6 --reconstructions 4 --iid \
-    --aggregation fedprox --fedprox-mu 0.05 --secure-aggregation secagg --secure-mask-std 0.1 \
-    --forgetting-method fedaf --fedaf-rounds 3 --reconstruction-method diffusion \
+   --aggregation secagg --secagg-threshold 3 \
+    --forgetting-method fedaf --fedaf-rounds 3 \
     --diffusion-model-id runwayml/stable-diffusion-v1-5 --dp-method dp-sgd --dp-sgd-noise 0.8
 ```
 
@@ -50,16 +50,12 @@ Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希
 常用命令行开关说明：
 
 - `--forgetting-method`：在 `fed_eraser`、`fedaf`、`one_shot` 三种遗忘策略之间切换。
-- `--reconstruction-method`：选择 `gradient` 或 `diffusion` 重建方式。若使用
-  扩散模型，可配合 `--diffusion-model-id`、`--diffusion-guidance`、
+- 扩散重建开箱即用，可通过 `--diffusion-model-id`、`--diffusion-guidance`、
   `--diffusion-steps` 与 `--diffusion-negative-prompt` 微调生成质量。
-- `--aggregation`：选择 `fedavg` 或 `fedprox` 聚合算法；后者可配合
-  `--fedprox-mu` 调整近端项强度。
-- `--secure-aggregation`：模拟 `secagg`、`ahsecagg`、`fastsecagg`（或 `pairwise`）
-  等安全聚合协议，掩码噪声幅度由 `--secure-mask-std` 控制，可与任何差分隐私策略
-  联用。
-- `--dp-sigma`、`--dp-mechanism` 与 `--dp-clip`：控制差分隐私噪声强度与分布
-  （Gaussian/Laplace/Student-t），用于评估攻击在不同隐私级别下的鲁棒性。
+- `--aggregation`：选择 `fedavg`、`fedprox`、`secagg`、`ahsecagg`、`fastsecagg`
+  等聚合机制，安全聚合选项可与任意差分隐私策略（`--dp-method`）协同启用。
+- `--dp-method` 及其子参数：分别对应 `dp-sgd`、`ldp-fl`、`adaptive-dp-fl`、`rdp-fl`
+  四种差分隐私策略。
 - `--gradient-batches` 与 `--gradient-params`：指定梯度差分统计所用的数据
   批次数以及关注的参数子串，从而影响生成的梯度热力图。
 
@@ -122,8 +118,8 @@ cannot be matched one-to-one with the exact forgotten training samples.
 
 - Register additional models in `src/models/nets.py` and expose them via
   `build_model`.
-- Implement new reconstruction methods by subclassing or replacing
-  `GradientReconstructor`.
+- Extend diffusion-based attacks by wrapping alternative text-to-image
+  pipelines inside `DiffusionReconstructor`.
 - Add alternative forgetting strategies inside
   `src/forgetting/class_forgetting.py`.
 
