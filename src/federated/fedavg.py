@@ -6,11 +6,12 @@ import logging
 import random
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 from torch import nn
 
+from .aggregation import AggregationConfig, AggregationMechanism, create_aggregation_mechanism
 from .client import Client
 from .dp import DifferentialPrivacyConfig, DifferentialPrivacyController, create_dp_controller
 
@@ -22,7 +23,7 @@ class ServerConfig:
     device: torch.device = torch.device("cpu")
     fraction: float = 1.0
     dp_config: DifferentialPrivacyConfig | None = None
-    secure_aggregation: str | None = None
+    aggregation: AggregationConfig = field(default_factory=AggregationConfig)
     seed: int = 0
 
 
@@ -49,6 +50,19 @@ class FederatedServer:
         self.dp_controller: DifferentialPrivacyController | None = create_dp_controller(
             config.dp_config, seed=config.seed
         )
+        self.aggregator: AggregationMechanism = create_aggregation_mechanism(config.aggregation)
+        if self.aggregator.is_secure:
+            LOGGER.info(
+                "Using secure aggregation mechanism '%s' with parameters=%s",
+                self.aggregator.name,
+                config.aggregation.parameters,
+            )
+        else:
+            LOGGER.info(
+                "Using aggregation mechanism '%s' with parameters=%s",
+                self.aggregator.name,
+                config.aggregation.parameters,
+            )
 
     def _select_clients(self) -> Sequence[Client]:
         if self.config.fraction == 1.0:
@@ -99,16 +113,12 @@ class FederatedServer:
             if self.dp_controller is not None
             else updates
         )
-        total_samples = sum(num_samples for _, num_samples in processed_updates)
-        aggregated: OrderedDict[str, torch.Tensor] = OrderedDict()
-        for name, param in global_state.items():
-            aggregated[name] = param.clone()
-
-        for state_dict, num_samples in processed_updates:
-            weight = num_samples / max(total_samples, 1)
-            for name, tensor in state_dict.items():
-                diff = tensor - global_state[name]
-                aggregated[name] += (diff * weight).to(aggregated[name].dtype)
+        aggregated = self.aggregator.aggregate(
+            global_state,
+            processed_updates,
+            round_index=round_index,
+            total_rounds=total_rounds,
+        )
 
         if self.dp_controller is not None:
             aggregated = self.dp_controller.postprocess_aggregate(
@@ -118,11 +128,6 @@ class FederatedServer:
                 total_rounds=total_rounds,
             )
 
-        if self.config.secure_aggregation not in (None, "none"):
-            LOGGER.info(
-                "Secure aggregation enabled using '%s'; only aggregated model is revealed",
-                self.config.secure_aggregation,
-            )
         return aggregated
 
     def train(self, num_rounds: int) -> nn.Module:

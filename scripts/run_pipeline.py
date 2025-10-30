@@ -5,6 +5,7 @@ import argparse
 import copy
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Sequence
 
@@ -21,6 +22,7 @@ from src.attacks.data_reconstruction import (
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
+from src.federated.aggregation import AggregationConfig
 from src.federated.client import Client, ClientConfig
 from src.federated.fedavg import FederatedServer, ServerConfig
 from src.forgetting.class_forgetting import (
@@ -44,6 +46,17 @@ INPUT_SHAPES: Dict[str, Sequence[int]] = {
     "mnist": (1, 28, 28),
     "fashionmnist": (1, 28, 28),
 }
+
+
+@dataclass
+class ResolvedAggregation:
+    mechanism: str
+    parameters: dict[str, object]
+    learning_rate: float
+    local_epochs: int
+    batch_size: int
+    client_fraction: float
+    proximal_mu: float | None = None
 
 def _count_targets_in_dataset(dataset, target_class: int) -> int:
     """Count how many samples in ``dataset`` belong to ``target_class``."""
@@ -85,6 +98,103 @@ def _compute_saliency_maps(model: torch.nn.Module, inputs: torch.Tensor) -> tupl
     saliency = grads.abs().amax(dim=1, keepdim=False)
     saliency = _normalize_heatmap(saliency)
     return saliency.detach(), preds.detach()
+
+
+def _parse_level_thresholds(raw: str | None) -> list[float] | None:
+    if raw is None:
+        return None
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        return None
+    try:
+        return [float(token) for token in tokens]
+    except ValueError as exc:  # pragma: no cover - defensive programming
+        raise ValueError("AHSecAgg level thresholds must be numeric values") from exc
+
+
+def _resolve_aggregation(args: argparse.Namespace) -> ResolvedAggregation:
+    mechanism = args.aggregation.lower()
+    if mechanism in {"pairwise", "pairwise_masking"}:
+        mechanism = "fastsecagg"
+    base = ResolvedAggregation(
+        mechanism=mechanism,
+        parameters={},
+        learning_rate=args.learning_rate,
+        local_epochs=args.local_epochs,
+        batch_size=args.batch_size,
+        client_fraction=args.fraction,
+    )
+
+    if mechanism == "fedavg":
+        return ResolvedAggregation(
+            mechanism="fedavg",
+            parameters={"weighting": args.fedavg_weight_strategy},
+            learning_rate=args.fedavg_lr if args.fedavg_lr is not None else base.learning_rate,
+            local_epochs=args.fedavg_local_epochs if args.fedavg_local_epochs is not None else base.local_epochs,
+            batch_size=args.fedavg_batch_size if args.fedavg_batch_size is not None else base.batch_size,
+            client_fraction=(
+                args.fedavg_client_fraction if args.fedavg_client_fraction is not None else base.client_fraction
+            ),
+            proximal_mu=None,
+        )
+    if mechanism == "fedprox":
+        return ResolvedAggregation(
+            mechanism="fedprox",
+            parameters={"weighting": args.fedprox_weight_strategy},
+            learning_rate=args.fedprox_lr if args.fedprox_lr is not None else base.learning_rate,
+            local_epochs=args.fedprox_local_epochs if args.fedprox_local_epochs is not None else base.local_epochs,
+            batch_size=args.fedprox_batch_size if args.fedprox_batch_size is not None else base.batch_size,
+            client_fraction=(
+                args.fedprox_client_fraction if args.fedprox_client_fraction is not None else base.client_fraction
+            ),
+            proximal_mu=args.fedprox_mu,
+        )
+    if mechanism == "secagg":
+        return ResolvedAggregation(
+            mechanism="secagg",
+            parameters={
+                "mask_seed": args.secagg_seed,
+                "threshold": args.secagg_threshold,
+                "dropout_tolerance": args.secagg_dropout_tolerance,
+                "retransmissions": args.secagg_retransmissions,
+                "key_refresh_interval": args.secagg_key_refresh,
+            },
+            learning_rate=base.learning_rate,
+            local_epochs=base.local_epochs,
+            batch_size=base.batch_size,
+            client_fraction=base.client_fraction,
+        )
+    if mechanism == "ahsecagg":
+        return ResolvedAggregation(
+            mechanism="ahsecagg",
+            parameters={
+                "cluster_size": args.ahsecagg_cluster_size,
+                "levels": args.ahsecagg_levels,
+                "level_thresholds": _parse_level_thresholds(args.ahsecagg_level_thresholds),
+                "dropout_rate": args.ahsecagg_dropout,
+                "mask_reuse": args.ahsecagg_mask_reuse,
+            },
+            learning_rate=base.learning_rate,
+            local_epochs=base.local_epochs,
+            batch_size=base.batch_size,
+            client_fraction=base.client_fraction,
+        )
+    if mechanism == "fastsecagg":
+        return ResolvedAggregation(
+            mechanism="fastsecagg",
+            parameters={
+                "group_count": args.fastsecagg_groups,
+                "key_agreement": args.fastsecagg_key_agreement,
+                "mask_update_frequency": args.fastsecagg_mask_update,
+                "timeout": args.fastsecagg_timeout,
+                "encryption": args.fastsecagg_encryption,
+            },
+            learning_rate=base.learning_rate,
+            local_epochs=base.local_epochs,
+            batch_size=base.batch_size,
+            client_fraction=base.client_fraction,
+        )
+    raise ValueError(f"Unsupported aggregation mechanism: {args.aggregation}")
 
 
 def _export_sample_heatmaps(
@@ -173,6 +283,148 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iid", action="store_true", help="Use IID data partitioning")
     parser.add_argument("--dirichlet-alpha", type=float, default=0.5)
     parser.add_argument("--fraction", type=float, default=1.0, help="Client sampling fraction per round")
+    parser.add_argument(
+        "--aggregation",
+        default="fedavg",
+        choices=["fedavg", "fedprox", "secagg", "ahsecagg", "fastsecagg", "pairwise", "pairwise_masking"],
+        help="Federated aggregation mechanism to coordinate client updates.",
+    )
+    parser.add_argument("--fedavg-lr", type=float, default=None, help="FedAvg: local client learning rate override.")
+    parser.add_argument(
+        "--fedavg-local-epochs",
+        type=int,
+        default=None,
+        help="FedAvg: number of local epochs performed by each client.",
+    )
+    parser.add_argument(
+        "--fedavg-client-fraction",
+        type=float,
+        default=None,
+        help="FedAvg: fraction of clients sampled per round.",
+    )
+    parser.add_argument(
+        "--fedavg-batch-size",
+        type=int,
+        default=None,
+        help="FedAvg: mini-batch size used for local training.",
+    )
+    parser.add_argument(
+        "--fedavg-weight-strategy",
+        default="samples",
+        choices=["samples", "uniform"],
+        help="FedAvg: aggregation weighting strategy (by samples or uniform).",
+    )
+    parser.add_argument("--fedprox-mu", type=float, default=0.01,
+                        help="FedProx: proximal regularisation coefficient μ.")
+    parser.add_argument("--fedprox-lr", type=float, default=None, help="FedProx: client learning rate override.")
+    parser.add_argument(
+        "--fedprox-local-epochs",
+        type=int,
+        default=None,
+        help="FedProx: number of local epochs per client.",
+    )
+    parser.add_argument(
+        "--fedprox-batch-size",
+        type=int,
+        default=None,
+        help="FedProx: mini-batch size used for local optimisation.",
+    )
+    parser.add_argument(
+        "--fedprox-client-fraction",
+        type=float,
+        default=None,
+        help="FedProx: fraction of clients sampled each round.",
+    )
+    parser.add_argument(
+        "--fedprox-weight-strategy",
+        default="samples",
+        choices=["samples", "uniform"],
+        help="FedProx: aggregation weighting rule.",
+    )
+    parser.add_argument("--secagg-seed", type=int, default=42, help="SecAgg: random seed for mask generation.")
+    parser.add_argument(
+        "--secagg-threshold",
+        type=int,
+        default=2,
+        help="SecAgg: minimum number of clients required for decryption.",
+    )
+    parser.add_argument(
+        "--secagg-dropout-tolerance",
+        type=float,
+        default=0.1,
+        help="SecAgg: tolerated client dropout ratio before aborting aggregation.",
+    )
+    parser.add_argument(
+        "--secagg-retransmissions",
+        type=int,
+        default=1,
+        help="SecAgg: communication retry attempts for masked shares.",
+    )
+    parser.add_argument(
+        "--secagg-key-refresh",
+        type=int,
+        default=10,
+        help="SecAgg: key refresh period measured in federated rounds.",
+    )
+    parser.add_argument(
+        "--ahsecagg-cluster-size",
+        type=int,
+        default=4,
+        help="AHSecAgg: number of clients per adaptive cluster.",
+    )
+    parser.add_argument(
+        "--ahsecagg-levels",
+        type=int,
+        default=2,
+        help="AHSecAgg: depth of the secure aggregation hierarchy.",
+    )
+    parser.add_argument(
+        "--ahsecagg-level-thresholds",
+        default=None,
+        help="AHSecAgg: comma-separated decryption thresholds for each hierarchy level.",
+    )
+    parser.add_argument(
+        "--ahsecagg-dropout",
+        type=float,
+        default=0.1,
+        help="AHSecAgg: tolerated dropout ratio within each cluster.",
+    )
+    parser.add_argument(
+        "--ahsecagg-mask-reuse",
+        default="never",
+        choices=["never", "round", "epoch"],
+        help="AHSecAgg: mask reuse policy across rounds.",
+    )
+    parser.add_argument(
+        "--fastsecagg-groups",
+        type=int,
+        default=2,
+        help="FastSecAgg: number of client groups for pairwise masking.",
+    )
+    parser.add_argument(
+        "--fastsecagg-key-agreement",
+        default="static",
+        choices=["static", "dynamic"],
+        help="FastSecAgg: key agreement mode between clients.",
+    )
+    parser.add_argument(
+        "--fastsecagg-mask-update",
+        type=int,
+        default=1,
+        help="FastSecAgg: frequency of mask regeneration in rounds.",
+    )
+    parser.add_argument(
+        "--fastsecagg-timeout",
+        type=float,
+        default=30.0,
+        help="FastSecAgg: fault-tolerance timeout window in seconds.",
+    )
+    parser.add_argument(
+        "--fastsecagg-encryption",
+        default="paillier",
+        choices=["paillier", "modular"],
+        help="FastSecAgg: encryption primitive applied to masked sums.",
+    )
     parser.add_argument("--target-class", type=int, default=0)
     parser.add_argument("--dp-sigma", type=float, default=0.0)
     parser.add_argument("--dp-clip", type=float, default=None)
@@ -298,12 +550,6 @@ def parse_args() -> argparse.Namespace:
         "--heatmap-cmap",
         default="coolwarm",
         help="Matplotlib colormap name used when rendering heatmaps",
-    )
-    parser.add_argument(
-        "--secure-aggregation",
-        default="none",
-        choices=["none", "bonawitz2017", "shamir", "homomorphic"],
-        help="Secure aggregation protocol to simulate.",
     )
     parser.add_argument(
         "--dp-method",
@@ -486,10 +732,12 @@ def main() -> None:
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device %s", device)
 
+    aggregation = _resolve_aggregation(args)
+
     federated_config = FederatedDataConfig(
         dataset=args.dataset,
         num_clients=args.num_clients,
-        batch_size=args.batch_size,
+        batch_size=aggregation.batch_size,
         iid=args.iid,
         dirichlet_alpha=args.dirichlet_alpha,
     )
@@ -508,9 +756,10 @@ def main() -> None:
     model = build_model(args.dataset, federated_dataset.num_classes)
 
     client_config = ClientConfig(
-        learning_rate=args.learning_rate,
-        local_epochs=args.local_epochs,
+        learning_rate=aggregation.learning_rate,
+        local_epochs=aggregation.local_epochs,
         device=device,
+        proximal_mu=aggregation.proximal_mu,
     )
     clients = [
         Client(client_id=i, dataloader=loader, config=client_config)
@@ -556,9 +805,12 @@ def main() -> None:
 
     server_config = ServerConfig(
         device=device,
-        fraction=args.fraction,
+        fraction=aggregation.client_fraction,
         dp_config=dp_config,
-        secure_aggregation=args.secure_aggregation,
+        aggregation=AggregationConfig(
+            mechanism=aggregation.mechanism,
+            parameters=aggregation.parameters,
+        ),
     )
     server = FederatedServer(model=model, clients=clients, config=server_config)
 
@@ -754,7 +1006,10 @@ def main() -> None:
         "attack_success": inference.predicted_class == args.target_class,
         "dp_method": args.dp_method,
         "dp_parameters": dp_parameters,
-        "secure_aggregation": args.secure_aggregation,
+        "aggregation": {
+            "mechanism": aggregation.mechanism,
+            "parameters": aggregation.parameters,
+        },
         "reconstruction_method": args.reconstruction_method,
         "class_label": class_label,
         "gradient_batches": args.gradient_batches,

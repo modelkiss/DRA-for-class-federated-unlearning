@@ -10,8 +10,10 @@ components:
   non-IID partitions across clients.
 - **Models** – lightweight CNNs for CIFAR (VGG-style) and MNIST (LeNet) along
   with a factory that can be extended to ResNet-style models.
-- **Federated Training** – standard FedAvg orchestration with optional
-  differential privacy (Gaussian noise + clipping) and secure aggregation.
+- **Federated Training** – configurable FedAvg or FedProx orchestration with
+  differential privacy (DP-SGD, LDP-FL, Adaptive DP-FL, RDP-FL) and secure
+  aggregation (SecAgg, AHSecAgg, Pairwise Masking/FastSecAgg) that can be used
+  jointly.
 **Forgetting** – remove a selected class from every client and apply
   FedEraser calibration, adaptive FedAF optimisation, or one-shot classifier
   surgery so that three distinct forgetting mechanisms can be compared.
@@ -29,14 +31,16 @@ source .venv/bin/activate
 pip install torch torchvision
 python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
     --target-class 6 --reconstructions 4 --iid \
+    --aggregation fedprox --fedprox-mu 0.05 --secure-aggregation secagg --secure-mask-std 0.1 \
     --forgetting-method fedaf --fedaf-rounds 3 --reconstruction-method diffusion \
-    --diffusion-model-id runwayml/stable-diffusion-v1-5 --secure-aggregation bonawitz2017 \
-    --dp-sigma 0.8 --dp-mechanism laplace
+    --diffusion-model-id runwayml/stable-diffusion-v1-5 --dp-method dp-sgd --dp-sgd-noise 0.8
 ```
 
 Outputs are stored in the `outputs/` directory (configurable through
 `--output`). Besides the reconstructed tensors and attack report, the pipeline
-logs baseline/post-forgetting accuracies and inferred classes, and now exports
+logs baseline/post-forgetting accuracies and inferred classes, persists both
+pre/post forgetting model checkpoints (`model_before.pt`, `model_after.pt`,
+`models.pt`), and now exports
 three heatmaps (`heatmap_accuracy_delta_<dataset>.png`、
 `heatmap_confusion_delta_<dataset>.png`、`heatmap_gradient_delta_<dataset>.png`)
 that visualise the per-class accuracy 变化、混淆矩阵差值以及梯度范数差异。默认使用
@@ -49,8 +53,11 @@ Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希
 - `--reconstruction-method`：选择 `gradient` 或 `diffusion` 重建方式。若使用
   扩散模型，可配合 `--diffusion-model-id`、`--diffusion-guidance`、
   `--diffusion-steps` 与 `--diffusion-negative-prompt` 微调生成质量。
-- `--secure-aggregation`：模拟不同的安全聚合协议
-  （`bonawitz2017`、`shamir`、`homomorphic`）。
+- `--aggregation`：选择 `fedavg` 或 `fedprox` 聚合算法；后者可配合
+  `--fedprox-mu` 调整近端项强度。
+- `--secure-aggregation`：模拟 `secagg`、`ahsecagg`、`fastsecagg`（或 `pairwise`）
+  等安全聚合协议，掩码噪声幅度由 `--secure-mask-std` 控制，可与任何差分隐私策略
+  联用。
 - `--dp-sigma`、`--dp-mechanism` 与 `--dp-clip`：控制差分隐私噪声强度与分布
   （Gaussian/Laplace/Student-t），用于评估攻击在不同隐私级别下的鲁棒性。
 - `--gradient-batches` 与 `--gradient-params`：指定梯度差分统计所用的数据
@@ -62,7 +69,7 @@ Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希
 src/
   attacks/                Label inference and reconstruction attacks
   data/                   Dataset loading and federated partitioning
-  federated/              FedAvg implementation with DP and secure aggregation
+  federated/              Aggregation (FedAvg/FedProx) with DP + secure aggregation
   forgetting/             Class removal and post-processing routines
   models/                 Neural network architectures for each dataset
   utils/                  Shared utilities (logging, metrics)

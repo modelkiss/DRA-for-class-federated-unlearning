@@ -11,7 +11,12 @@
   "attack_success": false,
   "dp_method": "none",
   "dp_parameters": {},
-  "secure_aggregation": "none",
+  "aggregation": {
+      "mechanism": "fedavg",
+      "parameters": {
+      "weighting": "samples"
+      }
+  },
   "reconstruction_method": "diffusion",
   "class_label": "ray",
   "gradient_batches": 2,
