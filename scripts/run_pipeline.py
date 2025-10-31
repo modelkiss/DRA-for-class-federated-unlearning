@@ -861,6 +861,20 @@ def main() -> None:
         gradient_filter=gradient_filter,
     )
     LOGGER.info("Label inference prediction: %d (ground truth: %d)", inference.predicted_class, args.target_class)
+    if inference.candidate_details:
+        LOGGER.info("候选类别多指标融合得分：")
+        for cls in sorted(inference.candidate_details):
+            metrics = inference.candidate_details[cls]
+            LOGGER.info(
+                "  类别 %d -> 融合得分 %.4f, ΔAcc %.2f%%, ΔConf %.2f%%, ΔW %.4f, ΔGrad %s, ΔSal %.4f",
+                cls,
+                metrics.get("fusion_score", float("nan")),
+                metrics.get("accuracy_delta", 0.0) * 100,
+                metrics.get("confidence_delta", 0.0) * 100,
+                metrics.get("weight_delta", 0.0),
+                "{:.4f}".format(metrics["gradient_delta"]) if metrics.get("gradient_delta") is not None else "N/A",
+                metrics.get("saliency_delta", 0.0) if metrics.get("saliency_delta") is not None else 0.0,
+            )
     if inference.gradient_delta is not None:
         gradient_norms = {name: tensor.norm().item() for name, tensor in inference.gradient_delta.items()}
         LOGGER.debug("Gradient delta norms: %s", gradient_norms)
