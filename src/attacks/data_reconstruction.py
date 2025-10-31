@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
 
+from .label_inference import SensitiveFeature
 
 @dataclass
 class DiffusionConfig:
@@ -37,6 +38,58 @@ class DiffusionReconstructor:
         self.config = config
         self.pipeline = StableDiffusionPipeline.from_pretrained(config.model_id)
         self.pipeline.to(config.device, dtype=config.dtype)
+        self._base_guidance_scale = float(config.guidance_scale)
+        self._guided_prompt_suffix: str = ""
+        self._active_features: list[SensitiveFeature] = []
+        self._guidance_hparams: dict[str, float] = {}
+
+    def reset_guidance(self) -> None:
+        """Reset any sensitive feature guidance applied to the pipeline."""
+
+        self.config.guidance_scale = self._base_guidance_scale
+        self._guided_prompt_suffix = ""
+        self._active_features = []
+        self._guidance_hparams: dict[str, float] = {}
+
+    def fine_tune_with_guidance(
+            self,
+            features: Sequence[SensitiveFeature],
+            *,
+            epochs: int = 1,
+            learning_rate: float = 1e-4,
+    ) -> None:
+        """Heuristically adapt prompts/guidance according to sensitive features."""
+
+        self.reset_guidance()
+        if not features:
+            return
+
+        self._active_features = list(features)
+        keywords = []
+        scores = []
+        for feature in features:
+            token = feature.name.replace("_", " ")
+            keywords.append(token)
+            scores.append(abs(float(feature.score)))
+
+        if keywords:
+            unique_keywords = []
+            seen = set()
+            for keyword in keywords:
+                if keyword in seen:
+                    continue
+                seen.add(keyword)
+                unique_keywords.append(keyword)
+            self._guided_prompt_suffix = ", ".join(unique_keywords)
+
+        if scores:
+            mean_score = float(np.mean(scores))
+            scale_delta = 0.1 * np.tanh(mean_score * max(1, epochs))
+            self.config.guidance_scale = float(self._base_guidance_scale * (1.0 + scale_delta))
+
+        # Store guidance metadata for potential reproducibility.
+        self._guidance_hparams = {"epochs": epochs, "learning_rate": learning_rate,
+                                  "mean_score": float(np.mean(scores)) if scores else 0.0}
 
     def reconstruct(
         self,
@@ -47,6 +100,8 @@ class DiffusionReconstructor:
     ) -> torch.Tensor:
         label = class_label or str(target_class)
         prompt = self.config.prompt_template.format(label=label)
+        if self._guided_prompt_suffix:
+            prompt = f"{prompt}, {self._guided_prompt_suffix}"
         kwargs = {
             "guidance_scale": self.config.guidance_scale,
             "num_inference_steps": self.config.num_inference_steps,

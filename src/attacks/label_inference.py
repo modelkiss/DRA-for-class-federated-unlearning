@@ -20,6 +20,18 @@ from ..utils.metrics import (
 
 
 @dataclass
+class SensitiveFeature:
+    """A sensitive feature inferred from forensic signals."""
+
+    name: str
+    score: float
+    source: str
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {"name": self.name, "score": float(self.score), "source": self.source}
+
+
+@dataclass
 class LabelInferenceResult:
     predicted_class: int
     score_vector: torch.Tensor
@@ -41,6 +53,7 @@ class LabelInferenceResult:
     gradient_class_scores: torch.Tensor | None = None
     saliency_delta: torch.Tensor | None = None
     candidate_details: dict[int, dict[str, float]] | None = None
+    sensitive_features: Sequence[SensitiveFeature] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +93,9 @@ class LabelInferenceResult:
             if self.saliency_delta is None
             else self.saliency_delta.tolist(),
             "candidate_details": self.candidate_details,
+            "sensitive_features": None
+            if self.sensitive_features is None
+            else [feature.to_dict() for feature in self.sensitive_features],
         }
 
 
@@ -448,7 +464,107 @@ def infer_forgotten_label(
         gradient_class_scores=None if gradient_scores is None else gradient_scores.detach().cpu(),
         saliency_delta=None if saliency_scores is None else saliency_scores.detach().cpu(),
         candidate_details=candidate_details,
+        sensitive_features=_infer_sensitive_features(
+            predicted=predicted,
+            accuracy_delta=accuracy_delta,
+            confidence_delta=confidence_delta,
+            weight_delta=weight_delta,
+            bias_delta=bias_delta,
+            gradient_delta=gradient_delta,
+            gradient_scores=gradient_scores,
+            saliency_scores=saliency_scores,
+        ),
     )
 
 
-__all__ = ["LabelInferenceResult", "infer_forgotten_label"]
+def _infer_sensitive_features(
+        *,
+        predicted: int,
+        accuracy_delta: torch.Tensor,
+        confidence_delta: torch.Tensor,
+        weight_delta: torch.Tensor,
+        bias_delta: torch.Tensor,
+        gradient_delta: OrderedDict[str, torch.Tensor] | None,
+        gradient_scores: torch.Tensor | None,
+        saliency_scores: torch.Tensor | None,
+        top_gradient_features: int = 5,
+) -> Sequence[SensitiveFeature]:
+    """Derive sensitive features describing the forgotten class."""
+
+    features: list[SensitiveFeature] = []
+
+    def _safe_item(tensor: torch.Tensor) -> float:
+        value = float(tensor.detach().cpu().float().item())
+        if math.isnan(value):
+            return 0.0
+        return value
+
+    features.append(
+        SensitiveFeature(
+            name="accuracy_delta",
+            score=_safe_item(accuracy_delta[predicted]),
+            source="accuracy",
+        )
+    )
+    features.append(
+        SensitiveFeature(
+            name="confidence_delta",
+            score=_safe_item(confidence_delta[predicted]),
+            source="confidence",
+        )
+    )
+    features.append(
+        SensitiveFeature(
+            name="classifier_weight_drop",
+            score=_safe_item(weight_delta[predicted]),
+            source="classifier",
+        )
+    )
+    features.append(
+        SensitiveFeature(
+            name="classifier_bias_drop",
+            score=_safe_item(bias_delta[predicted]),
+            source="classifier",
+        )
+    )
+
+    if gradient_scores is not None:
+        features.append(
+            SensitiveFeature(
+                name="gradient_class_score",
+                score=_safe_item(gradient_scores[predicted]),
+                source="gradient",
+            )
+        )
+
+    if saliency_scores is not None:
+        features.append(
+            SensitiveFeature(
+                name="saliency_delta",
+                score=_safe_item(saliency_scores[predicted]),
+                source="saliency",
+            )
+        )
+
+    if gradient_delta is not None:
+        gradient_importance: list[tuple[str, float]] = []
+        for name, tensor in gradient_delta.items():
+            grad = tensor.detach()
+            if grad.dim() == 0:
+                score = float(grad.abs().cpu().item())
+            elif grad.size(0) > predicted:
+                slice_tensor = grad[predicted]
+                score = float(slice_tensor.abs().mean().cpu().item())
+            else:
+                score = float(grad.abs().mean().cpu().item())
+            if not math.isnan(score):
+                gradient_importance.append((name, score))
+
+        gradient_importance.sort(key=lambda item: item[1], reverse=True)
+        for name, score in gradient_importance[:top_gradient_features]:
+            features.append(SensitiveFeature(name=name, score=score, source="gradient"))
+
+    return tuple(features)
+
+
+__all__ = ["LabelInferenceResult", "SensitiveFeature", "infer_forgotten_label"]

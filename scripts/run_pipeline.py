@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import Subset
 
 from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
-from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
+from src.attacks.label_inference import LabelInferenceResult, SensitiveFeature, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.aggregation import AggregationConfig
@@ -93,6 +93,64 @@ def _compute_saliency_maps(model: torch.nn.Module, inputs: torch.Tensor) -> tupl
     saliency = grads.abs().amax(dim=1, keepdim=False)
     saliency = _normalize_heatmap(saliency)
     return saliency.detach(), preds.detach()
+
+
+def _normalize_to_dataset(images: torch.Tensor, dataset: str) -> torch.Tensor:
+    """Normalise reconstructed images according to dataset statistics."""
+
+    mean, std = get_normalization_stats(dataset)
+    device = images.device
+    dtype = images.dtype
+    mean_tensor = torch.tensor(mean, device=device, dtype=dtype).view(1, -1, 1, 1)
+    std_tensor = torch.tensor(std, device=device, dtype=dtype).view(1, -1, 1, 1)
+    return (images - mean_tensor) / std_tensor
+
+
+def _evaluate_reconstruction_accuracy(
+    model: torch.nn.Module,
+    reconstructions: torch.Tensor,
+    target_class: int,
+    dataset: str,
+    device: torch.device,
+) -> float:
+    """Classify reconstructions and compute accuracy for ``target_class``."""
+
+    if reconstructions.numel() == 0:
+        return 0.0
+
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+        images = reconstructions.to(device)
+        images = images.clamp(0.0, 1.0)
+        images = _normalize_to_dataset(images, dataset)
+        logits = model(images)
+        predictions = logits.argmax(dim=1)
+        matches = predictions == target_class
+        return float(matches.float().mean().item())
+
+
+def _build_penalty_transform(penalties: dict[int, float]):
+    if not penalties:
+        return None
+
+    def transform(scores: torch.Tensor) -> torch.Tensor:
+        adjusted = scores.clone()
+        for cls, factor in penalties.items():
+            adjusted[cls] = adjusted[cls] * factor
+        return adjusted
+
+    return transform
+
+
+def _log_sensitive_features(features: Sequence[SensitiveFeature]) -> None:
+    if not features:
+        LOGGER.info("敏感特征推理：未检测到显著特征，使用基础扩散提示语。")
+        return
+
+    LOGGER.info("敏感特征推理：")
+    for feature in features:
+        LOGGER.info("  来源=%s, 特征=%s, 重要性=%.4f", feature.source, feature.name, feature.score)
 
 
 def _parse_level_thresholds(raw: str | None) -> list[float] | None:
@@ -427,6 +485,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("outputs"))
     parser.add_argument("--reconstructions", type=int, default=8)
     parser.add_argument(
+        "--reconstruction-tolerance",
+        type=float,
+        default=0.05,
+        help="允许生成样本分类准确率相对测试集差异的最大绝对值 (单位: 比例).",
+    )
+    parser.add_argument(
+        "--reinference-penalty",
+        type=float,
+        default=0.8,
+        help="重推理时对上一轮预测类别的融合得分缩放系数 (0-1).",
+    )
+    parser.add_argument(
+        "--max-reinference",
+        type=int,
+        default=5,
+        help="允许触发的最大重推理次数，超过即判定重建失败。",
+    )
+    parser.add_argument(
         "--forgetting-method",
         default="fed_eraser",
         choices=["fed_eraser", "fedaf", "one_shot"],
@@ -706,6 +782,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional negative prompt for diffusion sampling.",
     )
+    parser.add_argument(
+        "--diffusion-guidance-epochs",
+        type=int,
+        default=1,
+        help="敏感特征指导扩散模型时的迭代轮次 (启发式设置).",
+    )
+    parser.add_argument(
+        "--diffusion-guidance-lr",
+        type=float,
+        default=1e-4,
+        help="敏感特征指导扩散模型时的学习率 (仅用于记录).",
+    )
     return parser.parse_args()
 
 
@@ -850,39 +938,141 @@ def main() -> None:
         tokens = [token.strip() for token in args.gradient_params.split(",") if token.strip()]
         gradient_filter = tokens or None
 
-    inference = infer_forgotten_label(
-        before=pre_forgetting_model,
-        after=post_forgetting_model,
-        dataloader=federated_dataset.test_loader,
-        num_classes=federated_dataset.num_classes,
+    diffusion_config = DiffusionConfig(
+        model_id=args.diffusion_model_id,
+        guidance_scale=args.diffusion_guidance,
+        num_inference_steps=args.diffusion_steps,
         device=device,
-        ground_truth=args.target_class,
-        gradient_batches=args.gradient_batches if args.gradient_batches > 0 else None,
-        gradient_filter=gradient_filter,
+        negative_prompt=args.diffusion_negative_prompt,
     )
-    LOGGER.info("Label inference prediction: %d (ground truth: %d)", inference.predicted_class, args.target_class)
-    if inference.candidate_details:
-        LOGGER.info("候选类别多指标融合得分：")
-        for cls in sorted(inference.candidate_details):
-            metrics = inference.candidate_details[cls]
-            LOGGER.info(
-                "  类别 %d -> 融合得分 %.4f, ΔAcc %.2f%%, ΔConf %.2f%%, ΔW %.4f, ΔGrad %s, ΔSal %.4f",
-                cls,
-                metrics.get("fusion_score", float("nan")),
-                metrics.get("accuracy_delta", 0.0) * 100,
-                metrics.get("confidence_delta", 0.0) * 100,
-                metrics.get("weight_delta", 0.0),
-                "{:.4f}".format(metrics["gradient_delta"]) if metrics.get("gradient_delta") is not None else "N/A",
-                metrics.get("saliency_delta", 0.0) if metrics.get("saliency_delta") is not None else 0.0,
+    try:
+        diffusion = DiffusionReconstructor(diffusion_config)
+    except RuntimeError as exc:
+        LOGGER.error("Diffusion reconstruction failed: %s", exc)
+        raise SystemExit("Diffusion-based reconstruction requires the 'diffusers' package") from exc
+
+    penalties: dict[int, float] = {}
+    reinference_count = 0
+    successful_reconstruction_accuracy: float | None = None
+    class_label: str | None = None
+
+    while True:
+        transform = _build_penalty_transform(penalties)
+        inference = infer_forgotten_label(
+            before=pre_forgetting_model,
+            after=post_forgetting_model,
+            dataloader=federated_dataset.test_loader,
+            num_classes=federated_dataset.num_classes,
+            device=device,
+            ground_truth=args.target_class,
+            gradient_batches=args.gradient_batches if args.gradient_batches > 0 else None,
+            gradient_filter=gradient_filter,
+            transform=transform,
+        )
+
+        LOGGER.info(
+            "Label inference attempt %d -> 预测类别 %d (真实类别 %d)",
+            reinference_count + 1,
+            inference.predicted_class,
+            args.target_class,
+        )
+        if inference.candidate_details:
+            LOGGER.info("候选类别多指标融合得分：")
+            for cls in sorted(inference.candidate_details):
+                metrics = inference.candidate_details[cls]
+                LOGGER.info(
+                    "  类别 %d -> 融合得分 %.4f, ΔAcc %.2f%%, ΔConf %.2f%%, ΔW %.4f, ΔGrad %s, ΔSal %.4f",
+                    cls,
+                    metrics.get("fusion_score", float("nan")),
+                    metrics.get("accuracy_delta", 0.0) * 100,
+                    metrics.get("confidence_delta", 0.0) * 100,
+                    metrics.get("weight_delta", 0.0),
+                    "{:.4f}".format(metrics["gradient_delta"]) if metrics.get("gradient_delta") is not None else "N/A",
+                    metrics.get("saliency_delta", 0.0) if metrics.get("saliency_delta") is not None else 0.0,
+                )
+        if inference.gradient_delta is not None:
+            gradient_norms = {name: tensor.norm().item() for name, tensor in inference.gradient_delta.items()}
+            LOGGER.debug("Gradient delta norms: %s", gradient_norms)
+
+        if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
+            class_label = str(federated_dataset.class_names[inference.predicted_class])
+        else:
+            class_label = None
+
+        sensitive_features = list(inference.sensitive_features or [])
+        _log_sensitive_features(sensitive_features)
+
+        diffusion.fine_tune_with_guidance(
+            sensitive_features,
+            epochs=args.diffusion_guidance_epochs,
+            learning_rate=args.diffusion_guidance_lr,
+        )
+
+        candidate_reconstructions = diffusion.reconstruct(
+            target_class=inference.predicted_class,
+            num_samples=args.reconstructions,
+            class_label=class_label,
+        )
+
+        expected_shape = INPUT_SHAPES[args.dataset]
+        if candidate_reconstructions.shape[1:] != expected_shape:
+            LOGGER.debug(
+                "Resizing reconstructions from %s to expected shape %s",
+                candidate_reconstructions.shape[1:],
+                expected_shape,
             )
-    if inference.gradient_delta is not None:
-        gradient_norms = {name: tensor.norm().item() for name, tensor in inference.gradient_delta.items()}
-        LOGGER.debug("Gradient delta norms: %s", gradient_norms)
+            candidate_reconstructions = F.interpolate(
+                candidate_reconstructions,
+                size=expected_shape[1:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            if expected_shape[0] == 1 and candidate_reconstructions.shape[1] == 3:
+                candidate_reconstructions = candidate_reconstructions.mean(dim=1, keepdim=True)
+
+        baseline_class_accuracy = float(inference.per_class_before[inference.predicted_class].item())
+        reconstruction_accuracy = _evaluate_reconstruction_accuracy(
+            pre_forgetting_model,
+            candidate_reconstructions,
+            inference.predicted_class,
+            args.dataset,
+            device,
+        )
+        accuracy_gap = abs(reconstruction_accuracy - baseline_class_accuracy)
+        LOGGER.info(
+            "重构评估: 生成样本准确率=%.4f, 测试集同类准确率=%.4f, 差值=%.4f (阈值=%.4f)",
+            reconstruction_accuracy,
+            baseline_class_accuracy,
+            accuracy_gap,
+            args.reconstruction_tolerance,
+        )
+
+        if accuracy_gap <= args.reconstruction_tolerance:
+            reconstructions = candidate_reconstructions
+            successful_reconstruction_accuracy = reconstruction_accuracy
+            break
+
+        reinference_count += 1
+        LOGGER.error(
+            "重构准确率偏差 %.4f 超出允许范围，记录错误推理 %d 次，准备重新推理标签。",
+            accuracy_gap,
+            reinference_count,
+        )
+        if reinference_count > args.max_reinference:
+            LOGGER.error("超过最大重推理次数 %d，宣布重建失败。", args.max_reinference)
+            raise SystemExit("Reconstruction failed: exceeded maximum reinference attempts")
+
+        penalties[inference.predicted_class] = penalties.get(inference.predicted_class, 1.0) * args.reinference_penalty
+
+    inference_result = inference
+
+    if successful_reconstruction_accuracy is None:
+        successful_reconstruction_accuracy = 0.0
 
     per_class_records = []
     for cls in range(federated_dataset.num_classes):
-        before_acc = float(inference.per_class_before[cls].item())
-        after_acc = float(inference.per_class_after[cls].item())
+        before_acc = float(inference_result.per_class_before[cls].item())
+        after_acc = float(inference_result.per_class_after[cls].item())
         delta = before_acc - after_acc
         LOGGER.info(
             "类别 %d: 遗忘前 %.2f%%, 遗忘后 %.2f%%, 差值 %.2f%%",
@@ -900,44 +1090,6 @@ def main() -> None:
             }
         )
 
-    class_label = None
-    if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
-        class_label = str(federated_dataset.class_names[inference.predicted_class])
-
-    diffusion_config = DiffusionConfig(
-        model_id=args.diffusion_model_id,
-        guidance_scale=args.diffusion_guidance,
-        num_inference_steps=args.diffusion_steps,
-        device=device,
-        negative_prompt=args.diffusion_negative_prompt,
-    )
-    try:
-        diffusion = DiffusionReconstructor(diffusion_config)
-    except RuntimeError as exc:
-        LOGGER.error("Diffusion reconstruction failed: %s", exc)
-        raise SystemExit("Diffusion-based reconstruction requires the 'diffusers' package") from exc
-
-    reconstructions = diffusion.reconstruct(
-        target_class=inference.predicted_class,
-        num_samples=args.reconstructions,
-        class_label=class_label,
-    )
-
-    # Ensure reconstruction tensor matches dataset channel/size when using diffusion models.
-    expected_shape = INPUT_SHAPES[args.dataset]
-    if reconstructions.shape[1:] != expected_shape:
-        LOGGER.debug(
-            "Resizing reconstructions from %s to expected shape %s", reconstructions.shape[1:], expected_shape
-        )
-        reconstructions = F.interpolate(
-            reconstructions,
-            size=expected_shape[1:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        if expected_shape[0] == 1 and reconstructions.shape[1] == 3:
-            reconstructions = reconstructions.mean(dim=1, keepdim=True)
-
     args.output.mkdir(parents=True, exist_ok=True)
     torch.save(reconstructions, args.output / "reconstructed.pt")
     torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
@@ -949,17 +1101,17 @@ def main() -> None:
         },
         args.output / "models.pt",
     )
-    if inference.gradient_delta is not None:
+    if inference_result.gradient_delta is not None:
         torch.save(
             {
-                "before": inference.gradient_before,
-                "after": inference.gradient_after,
-                "delta": inference.gradient_delta,
+                "before": inference_result.gradient_before,
+                "after": inference_result.gradient_after,
+                "delta": inference_result.gradient_delta,
             },
             args.output / "gradient_deltas.pt",
         )
     with (args.output / "inference.json").open("w", encoding="utf-8") as handle:
-        json.dump(inference.to_dict(), handle, indent=2)
+        json.dump(inference_result.to_dict(), handle, indent=2)
     metadata = {
         "dataset": args.dataset,
         "num_clients": args.num_clients,
@@ -969,8 +1121,8 @@ def main() -> None:
         "post_accuracy": post_accuracy,
         "target_class": args.target_class,
         "target_class_sample_count": target_sample_count,
-        "predicted_class": inference.predicted_class,
-        "attack_success": inference.predicted_class == args.target_class,
+        "predicted_class": inference_result.predicted_class,
+        "attack_success": inference_result.predicted_class == args.target_class,
         "dp_method": args.dp_method,
         "dp_parameters": dp_parameters,
         "aggregation": {
@@ -982,6 +1134,21 @@ def main() -> None:
         "gradient_batches": args.gradient_batches,
         "gradient_params": gradient_filter,
         "diffusion_model_id": args.diffusion_model_id,
+        "diffusion_guidance": {
+            "final_scale": diffusion.config.guidance_scale,
+            "epochs": args.diffusion_guidance_epochs,
+            "learning_rate": args.diffusion_guidance_lr,
+            "metadata": getattr(diffusion, "_guidance_hparams", {}),
+        },
+        "reconstruction_accuracy": successful_reconstruction_accuracy,
+        "reconstruction_tolerance": args.reconstruction_tolerance,
+        "reinference_count": reinference_count,
+        "baseline_class_accuracy": float(
+            inference_result.per_class_before[inference_result.predicted_class].item()
+        ),
+        "sensitive_features": [
+            feature.to_dict() for feature in (inference_result.sensitive_features or [])
+        ],
         "heatmaps": {
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
@@ -991,7 +1158,7 @@ def main() -> None:
 
     if not args.no_heatmaps:
         heatmap_artifacts = export_heatmaps(
-            inference,
+            inference_result,
             output_dir=args.output,
             cmap=args.heatmap_cmap,
             dataset=args.dataset,
@@ -1009,7 +1176,12 @@ def main() -> None:
     with (args.output / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
 
-    LOGGER.info("Saved %d reconstructed samples and inference metadata to %s", len(reconstructions), args.output)
+    LOGGER.info(
+        "Saved %d reconstructed samples and inference metadata to %s (重推理次数=%d)",
+        len(reconstructions),
+        args.output,
+        reinference_count,
+    )
 
 
 def perform_forgetting(
