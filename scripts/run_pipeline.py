@@ -1099,10 +1099,10 @@ def main() -> None:
             for cls in sorted(inference.candidate_details):
                 metrics = inference.candidate_details[cls]
                 LOGGER.info(
-                    "  类别 %d -> 综合得分 %.4f, 阳性率下降 %.4f, 中心偏移 %.4f, 边缘下降 %.4f",
+                    "  类别 %d -> 综合得分 %.4f, 准确率下降 %.4f, 中心偏移 %.4f, 边缘下降 %.4f",
                     cls,
                     metrics.get("combined_score", 0.0),
-                    metrics.get("positive_rate_drop", 0.0),
+                    metrics.get("accuracy_drop", 0.0),
                     metrics.get("center_shift_mean", 0.0),
                     metrics.get("edge_drop_mean", 0.0),
                 )
@@ -1317,9 +1317,9 @@ def main() -> None:
         "baseline_class_accuracy": float(
             inference_result.per_class_before[inference_result.predicted_class].item()
         ),
-        "positive_rate_before": inference_result.positive_rate_before.tolist(),
-        "positive_rate_after": inference_result.positive_rate_after.tolist(),
-        "positive_rate_drop": inference_result.positive_rate_drop.tolist(),
+        "accuracy_before": inference_result.accuracy_before.tolist(),
+        "accuracy_after": inference_result.accuracy_after.tolist(),
+        "accuracy_drop": inference_result.accuracy_drop.tolist(),
         "first_stage_candidates": list(inference_result.first_stage_candidates),
         "second_stage_candidates": list(inference_result.second_stage_candidates),
         "similarity_scores": inference_result.similarity_scores,
