@@ -39,9 +39,9 @@ class LabelInferenceResult:
     per_class_after: torch.Tensor
     confusion_before: torch.Tensor
     confusion_after: torch.Tensor
-    positive_rate_before: torch.Tensor
-    positive_rate_after: torch.Tensor
-    positive_rate_drop: torch.Tensor
+    accuracy_before: torch.Tensor
+    accuracy_after: torch.Tensor
+    accuracy_drop: torch.Tensor
     first_stage_candidates: Sequence[int]
     second_stage_candidates: Sequence[int]
     heatmap_details: dict[int, dict[str, float]]
@@ -94,9 +94,9 @@ class LabelInferenceResult:
             "sensitive_features": None
             if self.sensitive_features is None
             else [feature.to_dict() for feature in self.sensitive_features],
-            "positive_rate_before": self.positive_rate_before.tolist(),
-            "positive_rate_after": self.positive_rate_after.tolist(),
-            "positive_rate_drop": self.positive_rate_drop.tolist(),
+            "accuracy_before": self.accuracy_before.tolist(),
+            "accuracy_after": self.accuracy_after.tolist(),
+            "accuracy_drop": self.accuracy_drop.tolist(),
             "first_stage_candidates": [int(item) for item in self.first_stage_candidates],
             "second_stage_candidates": [int(item) for item in self.second_stage_candidates],
             "heatmap_details": {
@@ -113,35 +113,6 @@ _SOBEL_X = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]])
 _SOBEL_Y = torch.tensor([[1.0, 2.0, 1.0], [0.0, 0.0, 0.0], [-1.0, -2.0, -1.0]])
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _per_class_confidence(
-    model: nn.Module,
-    dataloader: DataLoader,
-    num_classes: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Return average softmax confidence for the ground-truth class per label."""
-
-    model.eval()
-    totals = torch.zeros(num_classes, device=device)
-    counts = torch.zeros(num_classes, device=device)
-    with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-            probs = torch.softmax(outputs, dim=1)
-            for cls in range(num_classes):
-                mask = targets == cls
-                if mask.any():
-                    totals[cls] += probs[mask, cls].sum()
-                    counts[cls] += mask.sum()
-
-    confidences = torch.zeros_like(totals)
-    mask = counts > 0
-    confidences[mask] = totals[mask] / counts[mask]
-    return confidences
 
 
 def _collect_class_samples(
@@ -403,25 +374,25 @@ def infer_forgotten_label(
     confusion_delta = confusion_before - confusion_after
     accuracy_delta = per_before - per_after
 
-    positive_before = _per_class_confidence(before, dataloader, num_classes, device)
-    positive_after = _per_class_confidence(after, dataloader, num_classes, device)
-    positive_drop = positive_before - positive_after
+    accuracy_before = per_before
+    accuracy_after = per_after
+    accuracy_drop = accuracy_before - accuracy_after
 
-    LOGGER.info("标签推理阶段：各类别阳性率统计：")
+    LOGGER.info("标签推理阶段：各类别准确率统计：")
     for cls in range(num_classes):
         LOGGER.info(
-            "  类别 %d -> 遗忘前阳性率 %.4f, 遗忘后阳性率 %.4f, 差值 %.4f",
+            "  类别 %d -> 遗忘前准确率 %.4f, 遗忘后准确率 %.4f, 差值 %.4f",
             cls,
-            positive_before[cls].item(),
-            positive_after[cls].item(),
-            positive_drop[cls].item(),
+            accuracy_before[cls].item(),
+            accuracy_after[cls].item(),
+            accuracy_drop[cls].item(),
         )
 
-    if float(positive_drop.abs().max().item()) == 0.0:
-        raise RuntimeError("阳性率在遗忘前后完全一致，无法判断遗忘类别。")
+    if float(accuracy_drop.abs().max().item()) == 0.0:
+        raise RuntimeError("准确率在遗忘前后完全一致，无法判断遗忘类别。")
 
     candidate_count = max(1, math.ceil(num_classes * 0.6))
-    sorted_indices = torch.argsort(positive_drop, descending=True)
+    sorted_indices = torch.argsort(accuracy_drop, descending=True)
     first_stage_candidates = sorted_indices[:candidate_count].tolist()
     LOGGER.info(
         "第一阶段候选类别（取前60%%，共 %d 个）：%s",
@@ -442,7 +413,7 @@ def infer_forgotten_label(
     heatmap_cache: dict[int, dict[str, torch.Tensor]] = {}
     candidate_details: dict[int, dict[str, float]] = {}
 
-    normalized_positive_values = []
+    normalized_accuracy_values = []
     normalized_center_values = []
     normalized_edge_values = []
     valid_classes: list[int] = []
@@ -455,7 +426,7 @@ def infer_forgotten_label(
                 "samples": 0.0,
                 "center_shift_mean": 0.0,
                 "edge_drop_mean": 0.0,
-                "positive_rate_drop": float(positive_drop[cls].item()),
+                "accuracy_drop": float(accuracy_drop[cls].item()),
             }
             continue
 
@@ -482,14 +453,14 @@ def infer_forgotten_label(
         edge_drop_mean = float((edge_before - edge_after).mean().item())
         edge_drop_positive = max(0.0, edge_drop_mean)
 
-        positive_component = max(0.0, float(positive_drop[cls].item()))
+        accuracy_component = max(0.0, float(accuracy_drop[cls].item()))
 
         LOGGER.info(
-            "  类别 %d -> 热力图中心偏移均值 %.4f, 边缘关注下降均值 %.4f, 阳性率下降 %.4f",
+            "  类别 %d -> 热力图中心偏移均值 %.4f, 边缘关注下降均值 %.4f, 准确率下降 %.4f",
             cls,
             center_diff_mean,
             edge_drop_mean,
-            positive_component,
+            accuracy_component,
         )
 
         heatmap_details[cls] = {
@@ -500,7 +471,7 @@ def infer_forgotten_label(
             "edge_focus_before": float(edge_before.mean().item()),
             "edge_focus_after": float(edge_after.mean().item()),
             "edge_drop_mean": edge_drop_mean,
-            "positive_rate_drop": positive_component,
+            "accuracy_drop": accuracy_component,
         }
 
         heatmap_cache[cls] = {
@@ -511,22 +482,22 @@ def infer_forgotten_label(
         }
 
         valid_classes.append(cls)
-        normalized_positive_values.append(positive_component)
+        normalized_accuracy_values.append(accuracy_component)
         normalized_center_values.append(center_shift_positive)
         normalized_edge_values.append(edge_drop_positive)
 
     if not valid_classes:
         raise RuntimeError("第一阶段候选类别均缺乏样本，无法继续标签推理。")
 
-    positive_tensor = torch.tensor(normalized_positive_values, dtype=torch.float32)
+    accuracy_tensor = torch.tensor(normalized_accuracy_values, dtype=torch.float32)
     center_tensor = torch.tensor(normalized_center_values, dtype=torch.float32)
     edge_tensor = torch.tensor(normalized_edge_values, dtype=torch.float32)
 
-    positive_norm = _min_max_normalize(positive_tensor)
+    accuracy_norm = _min_max_normalize(accuracy_tensor)
     center_norm = _min_max_normalize(center_tensor)
     edge_norm = _min_max_normalize(edge_tensor)
 
-    combined_tensor = positive_norm + 0.5 * center_norm + 0.5 * edge_norm
+    combined_tensor = accuracy_norm + 0.5 * center_norm + 0.5 * edge_norm
 
     combined_scores: dict[int, float] = {}
     for index, cls in enumerate(valid_classes):
@@ -537,9 +508,9 @@ def infer_forgotten_label(
             "combined_score": combined,
         }
         LOGGER.info(
-            "  类别 %d -> 归一化指标：阳性率 %.4f, 中心偏移 %.4f, 边缘关注 %.4f, 综合得分 %.4f",
+            "  类别 %d -> 归一化指标：准确率 %.4f, 中心偏移 %.4f, 边缘关注 %.4f, 综合得分 %.4f",
             cls,
-            positive_norm[index].item(),
+            accuracy_norm[index].item(),
             center_norm[index].item(),
             edge_norm[index].item(),
             combined,
@@ -614,8 +585,8 @@ def infer_forgotten_label(
         details = heatmap_details[predicted]
         sensitive_features.append(
             SensitiveFeature(
-                name="positive_rate_drop",
-                score=details.get("positive_rate_drop", 0.0),
+                name="accuracy_drop",
+                score=details.get("accuracy_drop", 0.0),
                 source="confidence",
             )
         )
@@ -649,9 +620,9 @@ def infer_forgotten_label(
         per_class_after=per_after.detach().cpu(),
         confusion_before=confusion_before.detach().cpu(),
         confusion_after=confusion_after.detach().cpu(),
-        positive_rate_before=positive_before.detach().cpu(),
-        positive_rate_after=positive_after.detach().cpu(),
-        positive_rate_drop=positive_drop.detach().cpu(),
+        accuracy_before=accuracy_before.detach().cpu(),
+        accuracy_after=accuracy_after.detach().cpu(),
+        accuracy_drop=accuracy_drop.detach().cpu(),
         first_stage_candidates=tuple(first_stage_candidates),
         second_stage_candidates=tuple(second_stage_candidates),
         heatmap_details={cls: {key: float(value) for key, value in details.items()} for cls, details in heatmap_details.items()},
@@ -664,9 +635,6 @@ def infer_forgotten_label(
         gradient_delta=None,
         accuracy_delta=accuracy_delta.detach().cpu(),
         confusion_delta=confusion_delta.detach().cpu(),
-        confidence_before=positive_before.detach().cpu(),
-        confidence_after=positive_after.detach().cpu(),
-        confidence_delta=positive_drop.detach().cpu(),
         weight_delta=None,
         bias_delta=None,
         candidate_details={cls: {key: float(value) for key, value in details.items()} for cls, details in candidate_details.items()},
