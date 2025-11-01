@@ -980,77 +980,105 @@ def main() -> None:
     )
     server = FederatedServer(model=model, clients=clients, config=server_config)
 
-    LOGGER.info("Starting federated pre-training for %d rounds", args.rounds)
-    server.train(args.rounds)
-    pre_forgetting_model = copy.deepcopy(server.global_model)
+    args.output.mkdir(parents=True, exist_ok=True)
+    model_before_path = args.output / "model_before.pt"
+    model_after_path = args.output / "model_after.pt"
+    reuse_saved_models = False
+    if model_before_path.exists() and model_after_path.exists():
+        response = input(
+            "检测到已有遗忘前/后的模型权重，是否重新训练与遗忘？(yes 重新训练): "
+        ).strip().lower()
+        if response != "yes":
+            reuse_saved_models = True
+            LOGGER.info("用户选择复用已保存的模型权重，跳过联邦训练与遗忘阶段。")
 
-    baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
-    LOGGER.info("Baseline accuracy before forgetting: %.4f", baseline_accuracy)
+    forgetting_result: ForgettingResult | None = None
 
-    if args.forgetting_method == "fed_eraser":
-        method_config = FedEraserConfig(
-            history_window=args.fed_eraser_history,
-            calibration_rounds=args.fed_eraser_calibration_rounds,
-            calibration_lr=args.fed_eraser_lr,
-            calibration_client_fraction=args.fed_eraser_client_fraction,
-            update_weight_decay=args.fed_eraser_weight_decay,
-        )
-    elif args.forgetting_method == "fedaf":
-        method_config = FedAFConfig(
-            forgetting_regularization=args.fedaf_lambda,
-            retention_strength=args.fedaf_beta,
-            learning_rate=args.fedaf_lr,
-            class_mask_ratio=args.fedaf_mask_ratio,
-            stop_threshold=args.fedaf_stop_threshold,
-            optimisation_rounds=args.fedaf_rounds,
+    if reuse_saved_models:
+        pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
+        pre_forgetting_model.load_state_dict(torch.load(model_before_path, map_location=device))
+        post_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
+        post_forgetting_model.load_state_dict(torch.load(model_after_path, map_location=device))
+        baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
+        post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
+        LOGGER.info(
+            "复用模型完成：遗忘前准确率 %.4f, 遗忘后准确率 %.4f。",
+            baseline_accuracy,
+            post_accuracy,
         )
     else:
-        method_config = OneShotClassUnlearningConfig(
-            projection_dim=args.oneshot_projection_dim,
-            replacement_strength=args.oneshot_replacement_strength,
-            freeze_ratio=args.oneshot_freeze_ratio,
-            local_tuning_epochs=args.oneshot_local_epochs,
-            reconstruction_threshold=args.oneshot_reconstruction_threshold,
+        LOGGER.info("Starting federated pre-training for %d rounds", args.rounds)
+        server.train(args.rounds)
+        pre_forgetting_model = copy.deepcopy(server.global_model)
+
+        baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
+        LOGGER.info("Baseline accuracy before forgetting: %.4f", baseline_accuracy)
+
+        if args.forgetting_method == "fed_eraser":
+            method_config = FedEraserConfig(
+                history_window=args.fed_eraser_history,
+                calibration_rounds=args.fed_eraser_calibration_rounds,
+                calibration_lr=args.fed_eraser_lr,
+                calibration_client_fraction=args.fed_eraser_client_fraction,
+                update_weight_decay=args.fed_eraser_weight_decay,
+            )
+        elif args.forgetting_method == "fedaf":
+            method_config = FedAFConfig(
+                forgetting_regularization=args.fedaf_lambda,
+                retention_strength=args.fedaf_beta,
+                learning_rate=args.fedaf_lr,
+                class_mask_ratio=args.fedaf_mask_ratio,
+                stop_threshold=args.fedaf_stop_threshold,
+                optimisation_rounds=args.fedaf_rounds,
+            )
+        else:
+            method_config = OneShotClassUnlearningConfig(
+                projection_dim=args.oneshot_projection_dim,
+                replacement_strength=args.oneshot_replacement_strength,
+                freeze_ratio=args.oneshot_freeze_ratio,
+                local_tuning_epochs=args.oneshot_local_epochs,
+                reconstruction_threshold=args.oneshot_reconstruction_threshold,
+            )
+
+        torch.save(pre_forgetting_model.state_dict(), model_before_path)
+        forgetting_params_json = json.dumps(asdict(method_config), ensure_ascii=False)
+        LOGGER.info(
+            "联邦训练已完成，模型信息保存在 %s/model_before.pt。是否按照参数执行联邦遗忘步骤，具体参数如下：%s。",
+            args.output,
+            forgetting_params_json,
+        )
+        LOGGER.info(
+            "本次实验采用 %s 聚合机制，差分隐私算法=%s。",
+            aggregation.mechanism,
+            args.dp_method,
+        )
+        proceed_forgetting = input("请输入 yes 以继续执行联邦遗忘: ").strip().lower()
+        if proceed_forgetting != "yes":
+            LOGGER.info("用户选择终止流程，训练阶段的模型已保存至 %s。", args.output)
+            return
+
+        forgetting_result = perform_forgetting(
+            server=server,
+            dataset=federated_dataset,
+            client_config=client_config,
+            target_class=args.target_class,
+            method=args.forgetting_method,
+            input_shape=INPUT_SHAPES[args.dataset],
+            method_config=method_config,
         )
 
-    args.output.mkdir(parents=True, exist_ok=True)
-    torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
-    forgetting_params_json = json.dumps(asdict(method_config), ensure_ascii=False)
-    LOGGER.info(
-        "联邦训练已完成，模型信息保存在 %s/model_before.pt。是否按照参数执行联邦遗忘步骤，具体参数如下：%s。"
-        "本次实验采用 %s 聚合机制，差分隐私算法=%s。",
-        args.output,
-        forgetting_params_json,
-        aggregation.mechanism,
-        args.dp_method,
-    )
-    proceed_forgetting = input("请输入 yes 以继续执行联邦遗忘: ").strip().lower()
-    if proceed_forgetting != "yes":
-        LOGGER.info("用户选择终止流程，训练阶段的模型已保存至 %s。", args.output)
-        return
-
-    forgetting_result = perform_forgetting(
-        server=server,
-        dataset=federated_dataset,
-        client_config=client_config,
-        target_class=args.target_class,
-        method=args.forgetting_method,
-        input_shape=INPUT_SHAPES[args.dataset],
-        method_config=method_config,
-    )
-
-    post_forgetting_model = copy.deepcopy(server.global_model)
-    torch.save(post_forgetting_model.state_dict(), args.output / "model_after.pt")
-    post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
-    LOGGER.info(
-        "联邦遗忘操作已执行完毕，遗忘模型信息保存在 %s/model_after.pt。是否按照参数进行标签推理？",
-        args.output,
-    )
-    LOGGER.info("Accuracy after forgetting: %.4f", post_accuracy)
-    proceed_inference = input("请输入 yes 以继续标签推理: ").strip().lower()
-    if proceed_inference != "yes":
-        LOGGER.info("用户拒绝继续标签推理，流程结束。")
-        return
+        post_forgetting_model = copy.deepcopy(server.global_model)
+        torch.save(post_forgetting_model.state_dict(), model_after_path)
+        post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
+        LOGGER.info(
+            "联邦遗忘操作已执行完毕，遗忘模型信息保存在 %s/model_after.pt。是否按照参数进行标签推理？",
+            args.output,
+        )
+        LOGGER.info("Accuracy after forgetting: %.4f", post_accuracy)
+        proceed_inference = input("请输入 yes 以继续标签推理: ").strip().lower()
+        if proceed_inference != "yes":
+            LOGGER.info("用户拒绝继续标签推理，流程结束。")
+            return
 
     diffusion_config = DiffusionConfig(
         model_id=args.diffusion_model_id,
@@ -1266,13 +1294,14 @@ def main() -> None:
     torch.save(reconstructions, args.output / "reconstructed.pt")
     torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
     torch.save(post_forgetting_model.state_dict(), args.output / "model_after.pt")
-    torch.save(
-        {
-            "original": forgetting_result.original_state,
-            "forgotten": forgetting_result.forgotten_state,
-        },
-        args.output / "models.pt",
-    )
+    if forgetting_result is not None:
+        torch.save(
+            {
+                "original": forgetting_result.original_state,
+                "forgotten": forgetting_result.forgotten_state,
+            },
+            args.output / "models.pt",
+        )
     if inference_result.gradient_delta is not None:
         torch.save(
             {
@@ -1300,7 +1329,7 @@ def main() -> None:
         "aggregation": {
             "mechanism": aggregation.mechanism,
             "parameters": aggregation.parameters,
-            "is_secure": server.aggregator.is_secure,
+            "is_secure": getattr(server.aggregator, "is_secure", False),
         },
         "class_label": class_label,
         "diffusion_model_id": args.diffusion_model_id,
