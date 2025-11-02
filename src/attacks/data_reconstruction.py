@@ -1,4 +1,7 @@
-"""Diffusion-based reconstruction utilities for unlearning evaluation."""
+"""Diffusion-based reconstruction utilities for unlearning evaluation.
+LoRA is optional and OFF by default to maximize compatibility across diffusers versions.
+Enable by setting DiffusionConfig.use_lora=True.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,9 +11,11 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
+import logging
 
 from .label_inference import SensitiveFeature
 from src.utils.normalization import denormalize, get_normalization_stats
+
 
 @dataclass
 class DiffusionConfig:
@@ -30,6 +35,12 @@ class DiffusionConfig:
     prior_blend_weight: float = 0.3
     noise_offset: float = 0.05
 
+    # LoRA settings
+    use_lora: bool = False           # OFF by default
+    lora_rank: int = 4               # typical small rank
+    lora_alpha: int = 4              # scaling
+    lora_target: str = "all"         # 'all' | 'cross' | 'self'
+
 
 class DiffusionReconstructor:
     """Sample reconstructions using a text-to-image diffusion pipeline."""
@@ -42,6 +53,7 @@ class DiffusionReconstructor:
                 "Diffusion reconstruction requires the 'diffusers' package. Install it via 'pip install diffusers'."
             ) from exc
 
+        self.logger = logging.getLogger(__name__)
         self.config = config
         self.pipeline = StableDiffusionPipeline.from_pretrained(config.model_id)
         target_dtype = config.dtype
@@ -201,10 +213,18 @@ class DiffusionReconstructor:
         *,
         class_label: str | None = None,
     ) -> torch.Tensor:
+        """Generate `num_samples` images in a single batched call to avoid shape mismatches."""
         label = class_label or str(target_class)
         prompt = self.config.prompt_template.format(label=label)
         if self._guided_prompt_suffix:
             prompt = f"{prompt}, {self._guided_prompt_suffix}"
+
+        # Prepare a list of identical prompts to match batch size
+        prompts = [prompt] * int(num_samples)
+        negative_prompts = None
+        if self.config.negative_prompt is not None:
+            negative_prompts = [self.config.negative_prompt] * int(num_samples)
+
         kwargs = {
             "guidance_scale": self.config.guidance_scale,
             "num_inference_steps": self.config.num_inference_steps,
@@ -214,28 +234,60 @@ class DiffusionReconstructor:
         if self.config.width is not None:
             kwargs["width"] = self.config.width
 
+        # Pre-init latents for the full batch (B, 4, H//8, W//8) if available
         latents = self._prepare_initial_latents(num_samples)
 
-        images = []
-        callback = None
+        # Build optional callback (support both old and new API).
+        cb_legacy = None
+        cb_on_step_end = None
         if self._latent_prior_template is not None and self._heatmap_mask is not None:
-            callback = self._make_latent_guidance_callback(num_samples)
+            def _legacy_cb(step: int, timestep: int, latents_tensor: torch.Tensor) -> None:
+                # In-place prior-guidance on latents
+                template = self._latent_prior_template.to(latents_tensor.device, dtype=latents_tensor.dtype)
+                mask = self._latent_guidance_mask(latents_tensor.shape, latents_tensor.device, latents_tensor.dtype)
+                if mask is None:
+                    return
+                weight = float(self.config.prior_blend_weight)
+                latents_tensor.mul_(1.0 - mask * weight)
+                latents_tensor.add_(template * mask * weight)
 
-        for _ in range(num_samples):
-            result = self.pipeline(
-                prompt,
-                negative_prompt=self.config.negative_prompt,
-                latents=None if latents is None else latents.clone(),
-                callback=callback,
-                **kwargs,
-            )
-            pil_image = result.images[0]
-            image = torch.from_numpy(np.array(pil_image)).permute(2, 0, 1).float() / 255.0
-            images.append(image)
+            def _on_step_end(pipeline, step: int, timestep: int, callback_kwargs: dict) -> dict:
+                # Same logic but via callback_on_step_end API (signature includes pipeline/self)
+                lat = callback_kwargs.get("latents")
+                if lat is None:
+                    return callback_kwargs
+                _legacy_cb(step, timestep, lat)
+                callback_kwargs["latents"] = lat
+                return callback_kwargs
 
-        batch = torch.stack(images, dim=0)
+            cb_legacy = _legacy_cb
+            cb_on_step_end = _on_step_end
+
+        # Prefer new API if available
+        call_sig = inspect.signature(self.pipeline.__call__)
+        use_new_cb = "callback_on_step_end" in call_sig.parameters
+
+        # Single batched generation
+        result = self.pipeline(
+            prompts,
+            negative_prompt=negative_prompts,
+            latents=latents,
+            callback_on_step_end=cb_on_step_end if use_new_cb else None,
+            callback=cb_legacy if not use_new_cb else None,
+            **kwargs,
+        )
+
+        # Convert resulting images to a torch batch (B, 3, H, W)
+        pil_images = result.images
+        imgs = []
+        for img in pil_images:
+            arr = np.array(img, copy=False)
+            t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+            imgs.append(t)
+        batch = torch.stack(imgs, dim=0)
 
         if self._heatmap_mask is not None:
+            # Optional post-blend on image space (very light-touch)
             mask = self._heatmap_mask
             if mask.dim() == 3 and mask.size(0) == 1:
                 mask = mask.squeeze(0)
@@ -243,8 +295,7 @@ class DiffusionReconstructor:
                 mask = mask.unsqueeze(0)
             mask = mask.to(batch.device, dtype=batch.dtype)
             mask = F.interpolate(mask.unsqueeze(0), size=batch.shape[-2:], mode="bilinear", align_corners=False)
-            mask = mask.squeeze(0)
-            mask = mask.expand(batch.size(0), -1, -1)
+            mask = mask.squeeze(0).expand(batch.size(0), -1, -1)
             batch = batch * (0.5 + 0.5 * mask.unsqueeze(1)) + batch * (1 - mask.unsqueeze(1))
 
         return batch
@@ -270,23 +321,25 @@ class DiffusionReconstructor:
         images = images.to(device=device, dtype=dtype)
         images = images.clamp(0.0, 1.0)
 
-        try:
-            from diffusers.models.attention_processor import LoRAAttnProcessor
-        except ImportError:  # pragma: no cover - diffusers 版本差异
-            LoRAAttnProcessor = None
+        trainable_params = None
 
-        if LoRAAttnProcessor is not None:
-            self._ensure_lora_layers(LoRAAttnProcessor)
-            trainable_params = list(self._lora_layers.parameters()) if hasattr(self, "_lora_layers") else []
+        if self.config.use_lora:
+            ok = self._setup_lora_layers()
+            if ok and hasattr(self, "_lora_layers"):
+                trainable_params = list(self._lora_layers.parameters())
+            else:
+                logging.getLogger(__name__).warning("LoRA setup failed; falling back to UNet fine-tuning.")
+                trainable_params = list(self.pipeline.unet.parameters())
         else:
             trainable_params = list(self.pipeline.unet.parameters())
 
-        for param in self.pipeline.unet.parameters():
-            param.requires_grad = False
+        # Freeze all, then unfreeze trainable
+        for p in self.pipeline.unet.parameters():
+            p.requires_grad = False
+        for p in trainable_params:
+            p.requires_grad = True
 
-        for param in trainable_params:
-            param.requires_grad = True
-
+        # If nothing collected (shouldn't happen), unfreeze a minimal head
         if not trainable_params:
             trainable_params = []
             for module in self.pipeline.unet.modules():
@@ -346,10 +399,129 @@ class DiffusionReconstructor:
                 break
 
         self.pipeline.unet.eval()
-        for param in self.pipeline.unet.parameters():
-            param.requires_grad = False
+        for p in self.pipeline.unet.parameters():
+            p.requires_grad = False
 
         return total_steps
+
+    # ---------------------- LoRA setup helpers ----------------------
+
+    def _setup_lora_layers(self) -> bool:
+        """Try multiple strategies to enable LoRA. Return True if success, else False."""
+        try:
+            unet = self.pipeline.unet
+            # Strategy 1: diffusers built-in (preferred)
+            if hasattr(unet, "add_attn_procs"):
+                try:
+                    unet.add_attn_procs(self.config.lora_rank)
+                    params = []
+                    for name, proc in unet.attn_processors.items():
+                        # Heuristic: LoRA processors contain 'lora' parameters
+                        has_lora = any("lora" in n.lower() for n, _ in proc.named_parameters(recurse=True))
+                        if has_lora:
+                            for p in proc.parameters():
+                                p.requires_grad = True
+                                params.append(p)
+                    if not params:
+                        logging.getLogger(__name__).warning("add_attn_procs() returned no LoRA params; will try manual construction.")
+                    else:
+                        self._lora_layers = torch.nn.ParameterList(params)
+                        logging.getLogger(__name__).info("LoRA via add_attn_procs: %d params", sum(p.numel() for p in params))
+                        return True
+                except Exception as e:
+                    logging.getLogger(__name__).warning("unet.add_attn_procs failed: %s", e)
+
+            # Strategy 2: manual processor construction (2.0 or classic)
+            lora_cls = None
+            try:
+                from diffusers.models.attention_processor import LoRAAttnProcessor2_0 as _LORA  # type: ignore
+                lora_cls = _LORA
+            except Exception:
+                try:
+                    from diffusers.models.attention_processor import LoRAAttnProcessor as _LORA  # type: ignore
+                    lora_cls = _LORA
+                except Exception:
+                    lora_cls = None
+
+            if lora_cls is None:
+                logging.getLogger(__name__).warning("No LoRA processor class available in this diffusers version.")
+                return False
+
+            if not hasattr(unet, "attn_processors"):
+                logging.getLogger(__name__).warning("UNet has no attn_processors; cannot set LoRA processors.")
+                return False
+
+            lora_attn_procs = {}
+            for name in unet.attn_processors.keys():
+                # cross/self attention dim
+                if name.endswith("attn1.processor"):
+                    cross_attention_dim = None  # self-attn
+                else:
+                    cross_attention_dim = unet.config.cross_attention_dim
+
+                # hidden size per block
+                if name.startswith("mid_block"):
+                    hidden_size = unet.config.block_out_channels[-1]
+                elif name.startswith("up_blocks"):
+                    block_id = int(name.split(".")[1])
+                    hidden_size = unet.config.block_out_channels[::-1][block_id]
+                elif name.startswith("down_blocks"):
+                    block_id = int(name.split(".")[1])
+                    hidden_size = unet.config.block_out_channels[block_id]
+                else:
+                    hidden_size = unet.config.block_out_channels[0]
+
+                # try kwargs then positional
+                proc = None
+                try:
+                    sig = inspect.signature(lora_cls)
+                except Exception:
+                    sig = None
+                try:
+                    if sig is not None:
+                        kw = {"hidden_size": hidden_size, "cross_attention_dim": cross_attention_dim}
+                        if "rank" in sig.parameters:
+                            kw["rank"] = self.config.lora_rank
+                        if "network_alpha" in sig.parameters:
+                            kw["network_alpha"] = self.config.lora_alpha
+                        proc = lora_cls(**kw)
+                except Exception:
+                    proc = None
+                if proc is None:
+                    try:
+                        args = [hidden_size]
+                        if cross_attention_dim is not None:
+                            args.append(cross_attention_dim)
+                        proc = lora_cls(*args)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning("LoRA proc init failed for %s: %s", name, e)
+                        continue
+
+                lora_attn_procs[name] = proc
+
+            if not lora_attn_procs:
+                logging.getLogger(__name__).warning("No LoRA processors constructed.")
+                return False
+
+            unet.set_attn_processor(lora_attn_procs)
+            params = []
+            for proc in lora_attn_procs.values():
+                for p in proc.parameters():
+                    p.requires_grad = True
+                    params.append(p)
+            if not params:
+                logging.getLogger(__name__).warning("Constructed LoRA processors have no parameters.")
+                return False
+
+            self._lora_layers = torch.nn.ParameterList(params)
+            logging.getLogger(__name__).info("LoRA via manual processors: %d params", sum(p.numel() for p in params))
+            return True
+
+        except Exception as e:
+            logging.getLogger(__name__).warning("LoRA setup error: %s", e)
+            return False
+
+    # ---------------------- loss & utils ----------------------
 
     def _weighted_mse(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = (prediction - target) ** 2
@@ -392,7 +564,8 @@ class DiffusionReconstructor:
             return None
 
         device = self.config.device
-        dtype = self.config.dtype
+        # Use UNet dtype to avoid mismatch
+        dtype = self.pipeline.unet.dtype
         sigma = getattr(self.pipeline.scheduler, "init_noise_sigma", 1.0)
         latents = []
         for _ in range(num_samples):
@@ -427,132 +600,7 @@ class DiffusionReconstructor:
 
         return _callback
 
-    def _ensure_lora_layers(self, lora_cls) -> None:
-        if hasattr(self, "_lora_layers"):
-            return
-
-        unet = self.pipeline.unet
-        if not hasattr(unet, "attn_processors"):
-            self._lora_layers = torch.nn.ParameterList()
-            return
-        lora_attn_procs = {}
-        for name in unet.attn_processors.keys():
-            if name.endswith("attn1.processor"):
-                cross_attention_dim = None
-            else:
-                cross_attention_dim = unet.config.cross_attention_dim
-
-            if name.startswith("mid_block"):
-                hidden_size = unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name.split(".")[1])
-                hidden_size = unet.config.block_out_channels[::-1][block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name.split(".")[1])
-                hidden_size = unet.config.block_out_channels[block_id]
-            else:
-                hidden_size = unet.config.block_out_channels[0]
-
-            lora_attn_procs[name] = self._init_lora_processor(
-                lora_cls,
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-            )
-
-        unet.set_attn_processor(lora_attn_procs)
-        params = []
-        for proc in lora_attn_procs.values():
-            for param in proc.parameters():
-                param.requires_grad = True
-                params.append(param)
-        self._lora_layers = torch.nn.ParameterList(params)
-
-    def _init_lora_processor(self, lora_cls, *, hidden_size: int, cross_attention_dim: Optional[int]):
-        """Instantiate a LoRA attention processor with broad version compatibility."""
-
-        signature = inspect.signature(lora_cls.__init__)
-        params = list(signature.parameters.values())[1:]  # drop "self"
-
-        kwarg_aliases = {
-            "hidden_size": hidden_size,
-            "in_features": hidden_size,
-            "embed_dim": hidden_size,
-            "encoder_hidden_states_dim": cross_attention_dim,
-            "cross_attention_dim": cross_attention_dim,
-            "rank": 4,
-            "r": 4,
-            "network_alpha": 4,
-        }
-
-        init_kwargs = {}
-        for param in params:
-            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                # Defer to positional fallback for flexible signatures.
-                init_kwargs = None
-                break
-
-            if param.name in kwarg_aliases and kwarg_aliases[param.name] is not None:
-                init_kwargs[param.name] = kwarg_aliases[param.name]
-
-        def _ensure_callable(proc):
-            """Ensure processor instance has a callable __call__ (diffusers inspects it)."""
-            if not hasattr(proc, "__call__"):
-                # If instance has forward, bind it as __call__ on the instance.
-                forward = getattr(proc, "forward", None)
-                if forward is not None and callable(forward):
-                    try:
-                        import types
-
-                        proc.__call__ = types.MethodType(proc.forward, proc)
-                    except Exception:
-                        # Fallback to simple assignment if MethodType fails
-                        proc.__call__ = proc.forward
-                else:
-                    raise RuntimeError(
-                        f"LoRA processor instance has no callable __call__ or forward: {proc}"
-                    )
-            return proc
-
-        if init_kwargs is not None:
-            try:
-                proc = lora_cls(**init_kwargs)
-                return _ensure_callable(proc)
-            except TypeError:
-                # try fallback to positional below
-                pass
-
-        # Fallback to positional construction following the signature order.
-        positional_args = []
-        for param in params:
-            if param.kind is inspect.Parameter.VAR_KEYWORD:
-                continue
-
-            if param.kind is inspect.Parameter.VAR_POSITIONAL:
-                # Provide the standard ordered arguments when var-positional is present.
-                positional_args.extend(
-                    arg
-                    for arg in (
-                        hidden_size,
-                        cross_attention_dim,
-                        4,
-                    )
-                    if arg is not None
-                )
-                break
-
-            if param.name in {"hidden_size", "in_features", "embed_dim"}:
-                positional_args.append(hidden_size)
-            elif param.name in {"cross_attention_dim", "encoder_hidden_states_dim"}:
-                positional_args.append(cross_attention_dim)
-            elif param.name in {"rank", "r", "network_alpha"}:
-                positional_args.append(4)
-            elif param.default is inspect._empty:
-                raise TypeError(
-                    f"Unsupported LoRA processor signature for {lora_cls.__name__}: missing value for '{param.name}'"
-                )
-
-        proc = lora_cls(*positional_args)
-        return _ensure_callable(proc)
+    # ---------------------- text enc ----------------------
 
     def _encode_prompt_embeddings(self, prompt: str, batch_size: int) -> torch.Tensor:
         def _unwrap_prompt_embeds(result: torch.Tensor | tuple[torch.Tensor | None, ...]) -> torch.Tensor:
