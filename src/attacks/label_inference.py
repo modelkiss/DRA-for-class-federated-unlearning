@@ -232,6 +232,12 @@ def _edge_focus_metric(heatmaps: torch.Tensor, border_ratio: float) -> torch.Ten
     gradients_y = F.conv2d(heatmaps.unsqueeze(1), kernel_y, padding=1)
     magnitude = torch.sqrt(gradients_x.pow(2) + gradients_y.pow(2) + 1e-12)
 
+    if magnitude.dim() == 4 and magnitude.size(1) == 1:
+        magnitude = magnitude.squeeze(1)  # -> (batch, h, w)
+    elif magnitude.dim() == 4:
+        magnitude = magnitude.mean(dim=1)
+
+
     _, height, width = heatmaps.shape
     border_h = max(1, int(height * border_ratio))
     border_w = max(1, int(width * border_ratio))
