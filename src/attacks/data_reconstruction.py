@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from typing import Optional, Sequence
 
 import numpy as np
@@ -452,10 +453,10 @@ class DiffusionReconstructor:
             else:
                 hidden_size = unet.config.block_out_channels[0]
 
-            lora_attn_procs[name] = lora_cls(
+            lora_attn_procs[name] = self._init_lora_processor(
+                lora_cls,
                 hidden_size=hidden_size,
                 cross_attention_dim=cross_attention_dim,
-                rank=4,
             )
 
         unet.set_attn_processor(lora_attn_procs)
@@ -465,6 +466,71 @@ class DiffusionReconstructor:
                 param.requires_grad = True
                 params.append(param)
         self._lora_layers = torch.nn.ParameterList(params)
+
+    def _init_lora_processor(self, lora_cls, *, hidden_size: int, cross_attention_dim: Optional[int]):
+        """Instantiate a LoRA attention processor with broad version compatibility."""
+
+        signature = inspect.signature(lora_cls.__init__)
+        params = list(signature.parameters.values())[1:]  # drop "self"
+
+        kwarg_aliases = {
+            "hidden_size": hidden_size,
+            "in_features": hidden_size,
+            "embed_dim": hidden_size,
+            "encoder_hidden_states_dim": cross_attention_dim,
+            "cross_attention_dim": cross_attention_dim,
+            "rank": 4,
+            "r": 4,
+            "network_alpha": 4,
+        }
+
+        init_kwargs = {}
+        for param in params:
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                # Defer to positional fallback for flexible signatures.
+                init_kwargs = None
+                break
+
+            if param.name in kwarg_aliases and kwarg_aliases[param.name] is not None:
+                init_kwargs[param.name] = kwarg_aliases[param.name]
+
+        if init_kwargs is not None:
+            try:
+                return lora_cls(**init_kwargs)
+            except TypeError:
+                pass
+
+        # Fallback to positional construction following the signature order.
+        positional_args = []
+        for param in params:
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                continue
+
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                # Provide the standard ordered arguments when var-positional is present.
+                positional_args.extend(
+                    arg
+                    for arg in (
+                        hidden_size,
+                        cross_attention_dim,
+                        4,
+                    )
+                    if arg is not None
+                )
+                break
+
+            if param.name in {"hidden_size", "in_features", "embed_dim"}:
+                positional_args.append(hidden_size)
+            elif param.name in {"cross_attention_dim", "encoder_hidden_states_dim"}:
+                positional_args.append(cross_attention_dim)
+            elif param.name in {"rank", "r", "network_alpha"}:
+                positional_args.append(4)
+            elif param.default is inspect._empty:
+                raise TypeError(
+                    f"Unsupported LoRA processor signature for {lora_cls.__name__}: missing value for '{param.name}'"
+                )
+
+        return lora_cls(*positional_args)
 
     def _encode_prompt_embeddings(self, prompt: str, batch_size: int) -> torch.Tensor:
         if hasattr(self.pipeline, "_encode_prompt"):
