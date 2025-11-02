@@ -494,10 +494,31 @@ class DiffusionReconstructor:
             if param.name in kwarg_aliases and kwarg_aliases[param.name] is not None:
                 init_kwargs[param.name] = kwarg_aliases[param.name]
 
+        def _ensure_callable(proc):
+            """Ensure processor instance has a callable __call__ (diffusers inspects it)."""
+            if not hasattr(proc, "__call__"):
+                # If instance has forward, bind it as __call__ on the instance.
+                forward = getattr(proc, "forward", None)
+                if forward is not None and callable(forward):
+                    try:
+                        import types
+
+                        proc.__call__ = types.MethodType(proc.forward, proc)
+                    except Exception:
+                        # Fallback to simple assignment if MethodType fails
+                        proc.__call__ = proc.forward
+                else:
+                    raise RuntimeError(
+                        f"LoRA processor instance has no callable __call__ or forward: {proc}"
+                    )
+            return proc
+
         if init_kwargs is not None:
             try:
-                return lora_cls(**init_kwargs)
+                proc = lora_cls(**init_kwargs)
+                return _ensure_callable(proc)
             except TypeError:
+                # try fallback to positional below
                 pass
 
         # Fallback to positional construction following the signature order.
@@ -530,16 +551,35 @@ class DiffusionReconstructor:
                     f"Unsupported LoRA processor signature for {lora_cls.__name__}: missing value for '{param.name}'"
                 )
 
-        return lora_cls(*positional_args)
+        proc = lora_cls(*positional_args)
+        return _ensure_callable(proc)
 
     def _encode_prompt_embeddings(self, prompt: str, batch_size: int) -> torch.Tensor:
+        def _unwrap_prompt_embeds(result: torch.Tensor | tuple[torch.Tensor | None, ...]) -> torch.Tensor:
+            if isinstance(result, tuple):
+                for item in result:
+                    if isinstance(item, torch.Tensor):
+                        return item
+                raise TypeError("Prompt encoding returned only None values.")
+            return result
+
+        if hasattr(self.pipeline, "encode_prompt"):
+            result = self.pipeline.encode_prompt(
+                prompt,
+                device=self.config.device,
+                num_images_per_prompt=batch_size,
+                do_classifier_free_guidance=False,
+            )
+            return _unwrap_prompt_embeds(result)
+
         if hasattr(self.pipeline, "_encode_prompt"):
-            return self.pipeline._encode_prompt(
+            result = self.pipeline._encode_prompt(
                 prompt,
                 self.config.device,
                 num_images_per_prompt=batch_size,
                 do_classifier_free_guidance=False,
             )
+            return _unwrap_prompt_embeds(result)
 
         tokenizer = self.pipeline.tokenizer
         text_inputs = tokenizer(
