@@ -873,6 +873,30 @@ def parse_args() -> argparse.Namespace:
         help="敏感特征指导扩散模型时的学习率 (仅用于记录).",
     )
     parser.add_argument(
+        "--diffusion-train-batch-size",
+        type=int,
+        default=2,
+        help="使用遗忘样本微调扩散模型时的批量大小。",
+    )
+    parser.add_argument(
+        "--diffusion-train-steps",
+        type=int,
+        default=0,
+        help="扩散模型微调的最大步数，0 表示不限制。",
+    )
+    parser.add_argument(
+        "--diffusion-prior-blend",
+        type=float,
+        default=0.35,
+        help="采样过程中先验潜变量在热力图区域的融合权重。",
+    )
+    parser.add_argument(
+        "--diffusion-latent-noise",
+        type=float,
+        default=0.05,
+        help="从真实潜变量初始化时附加的噪声幅度。",
+    )
+    parser.add_argument(
         "--reconstruction-refine-steps",
         type=int,
         default=5,
@@ -1086,6 +1110,10 @@ def main() -> None:
         num_inference_steps=args.diffusion_steps,
         device=device,
         negative_prompt=args.diffusion_negative_prompt,
+        train_batch_size=args.diffusion_train_batch_size,
+        max_train_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
+        prior_blend_weight=args.diffusion_prior_blend,
+        noise_offset=args.diffusion_latent_noise,
     )
     try:
         diffusion = DiffusionReconstructor(diffusion_config)
@@ -1176,6 +1204,23 @@ def main() -> None:
             shape = INPUT_SHAPES[args.dataset][1:]
             guidance_mask = torch.ones(shape, dtype=torch.float32)
         diffusion.set_heatmap_guidance(guidance_mask)
+
+        train_images = prior_samples
+        if train_images is not None and train_images.numel() > 0:
+            try:
+                stats = get_normalization_stats(args.dataset)
+                train_images = denormalize(train_images, stats).clamp(0.0, 1.0)
+            except KeyError:
+                train_images = train_images.clamp(0.0, 1.0)
+        diffusion.fine_tune_with_guidance(
+            sensitive_features,
+            epochs=args.diffusion_guidance_epochs,
+            learning_rate=args.diffusion_guidance_lr,
+            images=train_images,
+            class_label=class_label,
+            batch_size=args.diffusion_train_batch_size,
+            max_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
+        )
 
         candidate_reconstructions = diffusion.reconstruct(
             target_class=inference.predicted_class,
@@ -1338,6 +1383,12 @@ def main() -> None:
             "epochs": args.diffusion_guidance_epochs,
             "learning_rate": args.diffusion_guidance_lr,
             "metadata": getattr(diffusion, "_guidance_hparams", {}),
+        },
+        "diffusion_training": {
+            "batch_size": args.diffusion_train_batch_size,
+            "max_steps": None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
+            "prior_blend_weight": args.diffusion_prior_blend,
+            "noise_offset": args.diffusion_latent_noise,
         },
         "reconstruction_accuracy_before": successful_acc_before,
         "reconstruction_accuracy_after": successful_acc_after,
