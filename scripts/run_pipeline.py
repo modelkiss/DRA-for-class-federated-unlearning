@@ -882,6 +882,12 @@ def parse_args() -> argparse.Namespace:
         help="Classifier-free guidance scale for diffusion reconstruction.",
     )
     parser.add_argument(
+        "--diffusion-strength",
+        type=float,
+        default=0.7,
+        help="图生图扩散强度 (0-1, 越大越偏离初始图像)。",
+    )
+    parser.add_argument(
         "--diffusion-negative-prompt",
         default=None,
         help="Optional negative prompt for diffusion sampling.",
@@ -920,7 +926,7 @@ def parse_args() -> argparse.Namespace:
         "--diffusion-latent-noise",
         type=float,
         default=0.05,
-        help="从真实潜变量初始化时附加的噪声幅度。",
+        help="图生图初始扰动在掩模外注入的噪声幅度。",
     )
     parser.add_argument(
         "--reconstruction-refine-steps",
@@ -1146,6 +1152,7 @@ def main() -> None:
         max_train_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
         prior_blend_weight=args.diffusion_prior_blend,
         noise_offset=args.diffusion_latent_noise,
+        strength=args.diffusion_strength,
     )
     try:
         diffusion = DiffusionReconstructor(diffusion_config)
@@ -1161,6 +1168,7 @@ def main() -> None:
     inference_result: LabelInferenceResult | None = None
     class_label: str | None = None
     user_confirmed_reconstruction = False
+    selected_init_indices: list[int] | None = None
 
     while True:
         transform = _build_penalty_transform(penalties)
@@ -1224,6 +1232,7 @@ def main() -> None:
                 break
             user_confirmed_reconstruction = True
 
+        LOGGER.info("链路推进：执行敏感特征推理以定位可视线索……")
         features, feature_masks = infer_sensitive_features(
             inference,
             pre_forgetting_model,
@@ -1256,14 +1265,62 @@ def main() -> None:
                 shape = INPUT_SHAPES[args.dataset][1:]
                 guidance_mask = torch.ones(shape, dtype=torch.float32)
         diffusion.set_heatmap_guidance(guidance_mask)
+        LOGGER.info("已将敏感区域掩模注入扩散模型，准备引导微调。")
 
-        train_images = prior_samples
-        if train_images is not None and train_images.numel() > 0:
+        denorm_priors: torch.Tensor | None = None
+        if prior_samples is not None and prior_samples.numel() > 0:
             try:
                 stats = get_normalization_stats(args.dataset)
-                train_images = denormalize(train_images, stats).clamp(0.0, 1.0)
+                denorm_priors = denormalize(prior_samples, stats).clamp(0.0, 1.0)
             except KeyError:
-                train_images = train_images.clamp(0.0, 1.0)
+                denorm_priors = prior_samples.clamp(0.0, 1.0)
+        else:
+            LOGGER.warning("预测类别 %d 在样本库中为空，图生图将退化为噪声初始。", inference.predicted_class)
+
+        train_images = denorm_priors
+        init_indices: list[int] = []
+        initial_images: torch.Tensor | None = None
+        if denorm_priors is not None and denorm_priors.numel() > 0:
+            available = denorm_priors.size(0)
+            LOGGER.info("图生图初始图像候选数量：%d", available)
+            prompt_msg = (
+                f"请输入用于图生图初始图像的索引(0-{available - 1}, 逗号分隔, 留空则随机): "
+            )
+            selection_raw = input(prompt_msg).strip()
+            if selection_raw:
+                tokens = [token.strip() for token in selection_raw.split(",") if token.strip()]
+                for token in tokens:
+                    try:
+                        idx = int(token)
+                    except ValueError:
+                        LOGGER.warning("忽略非法索引输入：%s", token)
+                        continue
+                    if 0 <= idx < available:
+                        init_indices.append(idx)
+                    else:
+                        LOGGER.warning("索引 %d 超出范围，已忽略。", idx)
+            if not init_indices:
+                random_idx = int(torch.randint(0, available, (1,)).item())
+                LOGGER.info("未指定索引，随机选择测试样本 %d 作为初始图像。", random_idx)
+                init_indices = [random_idx]
+            else:
+                seen = set()
+                ordered: list[int] = []
+                for idx in init_indices:
+                    if idx not in seen:
+                        ordered.append(idx)
+                        seen.add(idx)
+                init_indices = ordered
+                LOGGER.info("选择的初始测试样本索引：%s", init_indices)
+            initial_images = denorm_priors[init_indices]
+            selected_init_indices = init_indices
+        else:
+            LOGGER.info("缺少同类测试图像，改为随机噪声初始化扩散过程。")
+
+        LOGGER.info(
+            "引导扩散/梯度微调：使用 %d 张初始样本。",
+            0 if train_images is None or train_images.numel() == 0 else train_images.size(0),
+        )
         diffusion.fine_tune_with_guidance(
             sensitive_features,
             epochs=args.diffusion_guidance_epochs,
@@ -1278,6 +1335,7 @@ def main() -> None:
             target_class=inference.predicted_class,
             num_samples=args.reconstructions,
             class_label=class_label,
+            init_images=initial_images,
         )
 
         expected_shape = INPUT_SHAPES[args.dataset]
@@ -1441,6 +1499,7 @@ def main() -> None:
             "max_steps": None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
             "prior_blend_weight": args.diffusion_prior_blend,
             "noise_offset": args.diffusion_latent_noise,
+            "strength": args.diffusion_strength,
         },
         "reconstruction_accuracy_before": successful_acc_before,
         "reconstruction_accuracy_after": successful_acc_after,
@@ -1458,6 +1517,7 @@ def main() -> None:
         "sensitive_features": [
             feature.to_dict() for feature in (inference_result.sensitive_features or [])
         ],
+        "init_image_indices": selected_init_indices if selected_init_indices is not None else [],
         "heatmaps": {
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
