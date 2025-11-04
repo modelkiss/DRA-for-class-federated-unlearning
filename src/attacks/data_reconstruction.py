@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import logging
+from PIL import Image
 
 from .label_inference import SensitiveFeature
 from src.utils.normalization import denormalize, get_normalization_stats
@@ -34,6 +35,7 @@ class DiffusionConfig:
     max_train_steps: Optional[int] = None
     prior_blend_weight: float = 0.3
     noise_offset: float = 0.05
+    strength: float = 0.7
 
     # LoRA settings
     use_lora: bool = False           # OFF by default
@@ -47,7 +49,7 @@ class DiffusionReconstructor:
 
     def __init__(self, config: DiffusionConfig) -> None:
         try:
-            from diffusers import StableDiffusionPipeline  # type: ignore
+            from diffusers import StableDiffusionImg2ImgPipeline  # type: ignore
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError(
                 "Diffusion reconstruction requires the 'diffusers' package. Install it via 'pip install diffusers'."
@@ -55,7 +57,7 @@ class DiffusionReconstructor:
 
         self.logger = logging.getLogger(__name__)
         self.config = config
-        self.pipeline = StableDiffusionPipeline.from_pretrained(config.model_id)
+        self.pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(config.model_id)
         target_dtype = config.dtype
         if config.device.type == "cpu":
             target_dtype = torch.float32
@@ -65,12 +67,10 @@ class DiffusionReconstructor:
         self._guided_prompt_suffix: str = ""
         self._active_features: list[SensitiveFeature] = []
         self._guidance_hparams: dict[str, float] = {}
-        self._prior_latent: torch.Tensor | None = None
-        self._prior_latent_bank: list[torch.Tensor] = []
-        self._latent_prior_template: torch.Tensor | None = None
         self._heatmap_mask: torch.Tensor | None = None
         self._latent_mask_cache: torch.Tensor | None = None
         self._trained_steps: int = 0
+        self._prior_image_bank: list[torch.Tensor] = []
 
     def reset_guidance(self) -> None:
         """Reset any sensitive feature guidance applied to the pipeline."""
@@ -79,12 +79,10 @@ class DiffusionReconstructor:
         self._guided_prompt_suffix = ""
         self._active_features = []
         self._guidance_hparams: dict[str, float] = {}
-        self._prior_latent = None
-        self._prior_latent_bank = []
-        self._latent_prior_template = None
         self._heatmap_mask = None
         self._latent_mask_cache = None
         self._trained_steps = 0
+        self._prior_image_bank = []
 
     def fine_tune_with_guidance(
         self,
@@ -164,9 +162,7 @@ class DiffusionReconstructor:
 
         _ = dataset  # 参数保留用于接口兼容
         if samples is None or samples.numel() == 0:
-            self._prior_latent = None
-            self._prior_latent_bank = []
-            self._latent_prior_template = None
+            self._prior_image_bank = []
             self._latent_mask_cache = None
             return
 
@@ -179,20 +175,9 @@ class DiffusionReconstructor:
         except KeyError:
             pass
 
-        try:
-            to_device = samples.to(self.config.device, dtype=self.pipeline.unet.dtype).clamp(0.0, 1.0)
-            latents = self.pipeline.vae.encode((to_device * 2.0) - 1.0).latent_dist.mean
-            scale = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
-            latents = (latents * scale).detach()
-            self._prior_latent_bank = [latent.unsqueeze(0) for latent in latents]
-            self._prior_latent = latents.mean(dim=0, keepdim=True)
-            self._latent_prior_template = self._prior_latent.clone()
-            self._latent_mask_cache = None
-        except Exception:  # pragma: no cover - 依赖diffusers内部实现
-            self._prior_latent = None
-            self._prior_latent_bank = []
-            self._latent_prior_template = None
-            self._latent_mask_cache = None
+        samples = samples.detach().cpu().clamp(0.0, 1.0)
+        self._prior_image_bank = [tensor.clone() for tensor in samples]
+        self._latent_mask_cache = None
 
     def set_heatmap_guidance(self, mask: torch.Tensor | None) -> None:
         """设置热力图掩模用于后处理强化。"""
@@ -212,6 +197,7 @@ class DiffusionReconstructor:
         num_samples: int,
         *,
         class_label: str | None = None,
+        init_images: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate `num_samples` images in a single batched call to avoid shape mismatches."""
         label = class_label or str(target_class)
@@ -225,55 +211,29 @@ class DiffusionReconstructor:
         if self.config.negative_prompt is not None:
             negative_prompts = [self.config.negative_prompt] * int(num_samples)
 
+        images = self._prepare_initial_images(init_images, num_samples)
+
         kwargs = {
             "guidance_scale": self.config.guidance_scale,
             "num_inference_steps": self.config.num_inference_steps,
+            "strength": self.config.strength,
         }
-        if self.config.height is not None:
-            kwargs["height"] = self.config.height
-        if self.config.width is not None:
-            kwargs["width"] = self.config.width
+        if negative_prompts is not None:
+            kwargs["negative_prompt"] = negative_prompts
 
-        # Pre-init latents for the full batch (B, 4, H//8, W//8) if available
-        latents = self._prepare_initial_latents(num_samples)
-
-        # Build optional callback (support both old and new API).
-        cb_legacy = None
-        cb_on_step_end = None
-        if self._latent_prior_template is not None and self._heatmap_mask is not None:
-            def _legacy_cb(step: int, timestep: int, latents_tensor: torch.Tensor) -> None:
-                # In-place prior-guidance on latents
-                template = self._latent_prior_template.to(latents_tensor.device, dtype=latents_tensor.dtype)
-                mask = self._latent_guidance_mask(latents_tensor.shape, latents_tensor.device, latents_tensor.dtype)
-                if mask is None:
-                    return
-                weight = float(self.config.prior_blend_weight)
-                latents_tensor.mul_(1.0 - mask * weight)
-                latents_tensor.add_(template * mask * weight)
-
-            def _on_step_end(pipeline, step: int, timestep: int, callback_kwargs: dict) -> dict:
-                # Same logic but via callback_on_step_end API (signature includes pipeline/self)
-                lat = callback_kwargs.get("latents")
-                if lat is None:
-                    return callback_kwargs
-                _legacy_cb(step, timestep, lat)
-                callback_kwargs["latents"] = lat
-                return callback_kwargs
-
-            cb_legacy = _legacy_cb
-            cb_on_step_end = _on_step_end
-
-        # Prefer new API if available
         call_sig = inspect.signature(self.pipeline.__call__)
-        use_new_cb = "callback_on_step_end" in call_sig.parameters
+        if "image" not in call_sig.parameters:
+            raise RuntimeError("当前扩散模型不支持图生图模式，请切换 diffusers pipeline。")
 
-        # Single batched generation
+        pipeline_prompt: list[str] | str = prompts
+        if num_samples == 1:
+            pipeline_prompt = prompts[0]
+            if negative_prompts is not None:
+                kwargs["negative_prompt"] = negative_prompts[0]
+
         result = self.pipeline(
-            prompts,
-            negative_prompt=negative_prompts,
-            latents=latents,
-            callback_on_step_end=cb_on_step_end if use_new_cb else None,
-            callback=cb_legacy if not use_new_cb else None,
+            pipeline_prompt,
+            image=images,
             **kwargs,
         )
 
@@ -303,6 +263,88 @@ class DiffusionReconstructor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _prepare_initial_images(
+        self,
+        init_images: torch.Tensor | None,
+        num_samples: int,
+    ) -> list[Image.Image]:
+        """Prepare initial images for img2img sampling, applying mask-based corruption."""
+
+        if init_images is not None and init_images.numel() > 0:
+            base = init_images.detach().clone()
+        elif self._prior_image_bank:
+            indices = [np.random.randint(0, len(self._prior_image_bank)) for _ in range(max(1, num_samples))]
+            base = torch.stack([self._prior_image_bank[idx] for idx in indices], dim=0)
+        else:
+            # Fallback to random noise if no priors are available
+            default_size = getattr(self.pipeline.unet.config, "sample_size", 64) * 8
+            height = self.config.height or default_size
+            width = self.config.width or default_size
+            base = torch.rand(num_samples, 3, height, width)
+
+        if base.dim() != 4:
+            raise ValueError("初始图像张量形状必须为 (B,C,H,W)。")
+
+        base = base.clamp(0.0, 1.0)
+        if base.size(1) == 1:
+            base = base.repeat(1, 3, 1, 1)
+
+        if base.size(0) < num_samples:
+            repeats = []
+            for index in range(num_samples):
+                repeats.append(base[index % base.size(0)])
+            base = torch.stack(repeats, dim=0)
+        elif base.size(0) > num_samples:
+            base = base[:num_samples]
+
+        mask = self._heatmap_mask
+        if mask is not None:
+            mask_tensor = mask.detach()
+            if mask_tensor.dim() == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            if mask_tensor.dim() == 3 and mask_tensor.size(0) != base.size(0):
+                mask_tensor = mask_tensor.mean(dim=0, keepdim=True)
+            mask_tensor = mask_tensor.to(base.device, dtype=base.dtype)
+            mask_tensor = F.interpolate(
+                mask_tensor.unsqueeze(0),
+                size=base.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            if mask_tensor.dim() == 2:
+                mask_tensor = mask_tensor.unsqueeze(0)
+            if mask_tensor.size(0) != base.size(0):
+                mask_tensor = mask_tensor.expand(base.size(0), -1, -1)
+            mask_tensor = mask_tensor.clamp(0.0, 1.0)
+            complement = 1.0 - mask_tensor
+            noise_strength = float(min(1.0, 0.3 + max(0.0, self.config.noise_offset)))
+            noise = torch.rand_like(base)
+            base = base * mask_tensor.unsqueeze(1) + (
+                noise_strength * noise + (1.0 - noise_strength) * base
+            ) * complement.unsqueeze(1)
+            base = base.clamp(0.0, 1.0)
+
+        target_height = self.config.height
+        target_width = self.config.width
+        if target_height is None or target_width is None:
+            default_size = getattr(self.pipeline.unet.config, "sample_size", 64) * 8
+            target_height = target_height or default_size
+            target_width = target_width or default_size
+
+        images: list[Image.Image] = []
+        for tensor in base:
+            tensor = tensor.clamp(0.0, 1.0)
+            array = (tensor.permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
+            if array.shape[2] == 1:
+                array = np.repeat(array, 3, axis=2)
+            pil_image = Image.fromarray(array)
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            if (pil_image.height, pil_image.width) != (target_height, target_width):
+                pil_image = pil_image.resize((target_width, target_height), Image.BILINEAR)
+            images.append(pil_image)
+        return images
 
     def _train_on_samples(
         self,
@@ -558,47 +600,6 @@ class DiffusionReconstructor:
         mask = mask.clamp(0.0, 1.0)
         self._latent_mask_cache = mask.detach().to(self.config.device)
         return mask.to(device=device, dtype=dtype)
-
-    def _prepare_initial_latents(self, num_samples: int) -> torch.Tensor | None:
-        if not self._prior_latent_bank:
-            return None
-
-        device = self.config.device
-        # Use UNet dtype to avoid mismatch
-        dtype = self.pipeline.unet.dtype
-        sigma = getattr(self.pipeline.scheduler, "init_noise_sigma", 1.0)
-        latents = []
-        for _ in range(num_samples):
-            base = self._prior_latent_bank[np.random.randint(0, len(self._prior_latent_bank))].to(device, dtype)
-            base = base.clone()
-            if self.config.noise_offset > 0:
-                base = base + torch.randn_like(base) * self.config.noise_offset
-            latents.append(base * sigma)
-        return torch.cat(latents, dim=0)
-
-    def _make_latent_guidance_callback(self, num_samples: int):
-        template = self._latent_prior_template
-        if template is None:
-            return None
-
-        template = template.to(self.config.device, dtype=self.config.dtype)
-        mask = self._latent_guidance_mask(
-            torch.Size([num_samples, template.size(1), template.size(2), template.size(3)]),
-            self.config.device,
-            self.config.dtype,
-        )
-        if mask is None:
-            return None
-
-        weight = float(self.config.prior_blend_weight)
-
-        def _callback(step: int, timestep: int, latents: torch.Tensor) -> None:
-            target = template.to(latents.device, dtype=latents.dtype)
-            guide_mask = mask.to(latents.device, dtype=latents.dtype)
-            latents.mul_(1.0 - guide_mask * weight)
-            latents.add_(target * guide_mask * weight)
-
-        return _callback
 
     # ---------------------- text enc ----------------------
 
