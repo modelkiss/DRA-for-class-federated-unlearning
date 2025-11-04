@@ -585,40 +585,6 @@ def infer_forgotten_label(
         {cls: float(score_vector[cls].item()) for cls in valid_classes},
     )
 
-    # 构造敏感特征描述
-    sensitive_features: list[SensitiveFeature] = []
-    if predicted in heatmap_details:
-        details = heatmap_details[predicted]
-        sensitive_features.append(
-            SensitiveFeature(
-                name="accuracy_drop",
-                score=details.get("accuracy_drop", 0.0),
-                source="confidence",
-            )
-        )
-        sensitive_features.append(
-            SensitiveFeature(
-                name="center_shift_mean",
-                score=details.get("center_shift_mean", 0.0),
-                source="heatmap_center",
-            )
-        )
-        sensitive_features.append(
-            SensitiveFeature(
-                name="edge_drop_mean",
-                score=details.get("edge_drop_mean", 0.0),
-                source="heatmap_edge",
-            )
-        )
-    if predicted in similarity_scores:
-        sensitive_features.append(
-            SensitiveFeature(
-                name="parameter_similarity",
-                score=similarity_scores[predicted],
-                source="parameter",
-            )
-        )
-
     return LabelInferenceResult(
         predicted_class=predicted,
         score_vector=score_vector.detach().cpu(),
@@ -631,7 +597,10 @@ def infer_forgotten_label(
         accuracy_drop=accuracy_drop.detach().cpu(),
         first_stage_candidates=tuple(first_stage_candidates),
         second_stage_candidates=tuple(second_stage_candidates),
-        heatmap_details={cls: {key: float(value) for key, value in details.items()} for cls, details in heatmap_details.items()},
+        heatmap_details={
+            cls: {key: float(value) for key, value in details.items()}
+            for cls, details in heatmap_details.items()
+        },
         similarity_scores={cls: float(score) for cls, score in similarity_scores.items()},
         heatmap_cache=heatmap_cache,
         sample_bank={cls: tensor.detach().cpu() for cls, tensor in sample_bank.items()},
@@ -643,8 +612,11 @@ def infer_forgotten_label(
         confusion_delta=confusion_delta.detach().cpu(),
         weight_delta=None,
         bias_delta=None,
-        candidate_details={cls: {key: float(value) for key, value in details.items()} for cls, details in candidate_details.items()},
-        sensitive_features=tuple(sensitive_features),
+        candidate_details={
+            cls: {key: float(value) for key, value in details.items()}
+            for cls, details in candidate_details.items()
+        },
+        sensitive_features=None,
     )
 
 __all__ = ["LabelInferenceResult", "SensitiveFeature", "infer_forgotten_label"]

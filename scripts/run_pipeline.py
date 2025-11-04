@@ -15,6 +15,7 @@ from torch.utils.data import Subset
 
 from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
 from src.attacks.label_inference import LabelInferenceResult, SensitiveFeature, infer_forgotten_label
+from src.attacks.sensitive_feature_inference import infer_sensitive_features
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.aggregation import AggregationConfig
@@ -240,6 +241,20 @@ def _parse_level_thresholds(raw: str | None) -> list[float] | None:
         return [float(token) for token in tokens]
     except ValueError as exc:  # pragma: no cover - defensive programming
         raise ValueError("AHSecAgg level thresholds must be numeric values") from exc
+
+
+def _parse_sfi_thresholds(raw: str | None) -> tuple[float, ...]:
+    default = (0.5, 0.7)
+    if raw is None:
+        return default
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        return default
+    try:
+        values = tuple(float(token) for token in tokens)
+    except ValueError as exc:  # pragma: no cover - defensive programming
+        raise ValueError("Sensitive feature thresholds must be numeric values") from exc
+    return values if values else default
 
 
 def _resolve_aggregation(args: argparse.Namespace) -> ResolvedAggregation:
@@ -839,6 +854,17 @@ def parse_args() -> argparse.Namespace:
         help="边缘纹理分析所采用的边界宽度占比 (0-0.5)。",
     )
     parser.add_argument(
+        "--sfi-top-k-patches",
+        type=int,
+        default=8,
+        help="敏感特征定位阶段输出的最高得分 patch 数量。",
+    )
+    parser.add_argument(
+        "--sfi-thresholds",
+        default="0.5,0.7",
+        help="敏感特征定位的热力图阈值列表 (归一化比例, 逗号分隔)。",
+    )
+    parser.add_argument(
         "--diffusion-model-id",
         default="runwayml/stable-diffusion-v1-5",
         help="Pretrained diffusion pipeline identifier (diffusers).",
@@ -917,6 +943,12 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device %s", device)
+
+    try:
+        sfi_thresholds = _parse_sfi_thresholds(args.sfi_thresholds)
+    except ValueError as exc:
+        LOGGER.error("Invalid sensitive feature thresholds: %s", exc)
+        raise SystemExit(str(exc)) from exc
 
     aggregation = _resolve_aggregation(args)
 
@@ -1192,17 +1224,37 @@ def main() -> None:
                 break
             user_confirmed_reconstruction = True
 
-        sensitive_features = list(inference.sensitive_features or [])
+        features, feature_masks = infer_sensitive_features(
+            inference,
+            pre_forgetting_model,
+            post_forgetting_model,
+            device=device,
+            k_patches=args.sfi_top_k_patches,
+            thresholds=sfi_thresholds,
+        )
+        sensitive_features = list(features)
+        inference.sensitive_features = tuple(sensitive_features)
         _log_sensitive_features(sensitive_features)
 
         prior_samples = inference.sample_bank.get(inference.predicted_class, torch.empty(0))
         diffusion.ingest_priors(prior_samples, args.dataset)
-        try:
-            guidance_mask = _build_guidance_mask(inference)
-        except ValueError as exc:
-            LOGGER.warning("构建热力图指导掩模失败：%s，使用全局掩模代替。", exc)
-            shape = INPUT_SHAPES[args.dataset][1:]
-            guidance_mask = torch.ones(shape, dtype=torch.float32)
+        guidance_mask = None
+        if feature_masks:
+            try:
+                stacked_masks = torch.stack(list(feature_masks.values()), dim=0)
+                combined_mask = stacked_masks.amax(dim=0)
+                guidance_mask = _normalize_heatmap(combined_mask.unsqueeze(0))[0]
+                LOGGER.info("敏感特征掩模：使用 %d 个 patch 的并集作为优先引导区域。", len(feature_masks))
+            except RuntimeError as exc:
+                LOGGER.warning("敏感特征掩模合成失败 (%s)，回退至热力图差异掩模。", exc)
+                guidance_mask = None
+        if guidance_mask is None:
+            try:
+                guidance_mask = _build_guidance_mask(inference)
+            except ValueError as exc:
+                LOGGER.warning("构建热力图指导掩模失败：%s，使用全局掩模代替。", exc)
+                shape = INPUT_SHAPES[args.dataset][1:]
+                guidance_mask = torch.ones(shape, dtype=torch.float32)
         diffusion.set_heatmap_guidance(guidance_mask)
 
         train_images = prior_samples
