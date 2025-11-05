@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Sequence, Tuple
+from collections import defaultdict
+import math
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
@@ -24,6 +27,7 @@ class FederatedDataConfig:
     num_workers: int = 4
     root: str = "./data"
     augment: bool = True
+    split_seed: int = 42
 
 
 def _build_transforms(dataset: str, train: bool) -> transforms.Compose:
@@ -43,6 +47,13 @@ def _build_transforms(dataset: str, train: bool) -> transforms.Compose:
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
             ]
         )
+    if dataset == "megaface":
+        size = 128
+        base_transforms = [transforms.Resize((size, size)), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
+        if train:
+            return transforms.Compose([transforms.RandomHorizontalFlip()] + base_transforms)
+        return transforms.Compose(base_transforms)
+
     # MNIST style datasets
     return transforms.Compose(
         [
@@ -52,7 +63,57 @@ def _build_transforms(dataset: str, train: bool) -> transforms.Compose:
     )
 
 
-def get_datasets(name: str, root: str = "./data", download: bool = True) -> Tuple[Dataset, Dataset, int]:
+class _TransformSubset(Dataset):
+    """Subset wrapper applying a transform lazily."""
+
+    def __init__(self, dataset: Dataset, indices: Sequence[int], transform: transforms.Compose | None) -> None:
+        self.dataset = dataset
+        self.indices = list(indices)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        image, label = self.dataset[self.indices[idx]]
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
+
+def _stratified_split_indices(targets: Sequence[int], test_ratio: float, *, seed: int) -> tuple[list[int], list[int]]:
+    if not 0.0 < test_ratio < 1.0:
+        raise ValueError("test_ratio must be between 0 and 1")
+
+    generator = torch.Generator().manual_seed(seed)
+    class_to_indices: Dict[int, list[int]] = defaultdict(list)
+    for index, label in enumerate(targets):
+        class_to_indices[int(label)].append(index)
+
+    train_indices: list[int] = []
+    test_indices: list[int] = []
+    for indices in class_to_indices.values():
+        if not indices:
+            continue
+        perm = torch.randperm(len(indices), generator=generator).tolist()
+        shuffled = [indices[i] for i in perm]
+        test_count = max(1, math.ceil(len(indices) * test_ratio)) if len(indices) > 1 else 1
+        if test_count >= len(indices):
+            test_count = len(indices) - 1
+        if test_count <= 0:
+            test_count = 1
+        test_indices.extend(shuffled[:test_count])
+        train_indices.extend(shuffled[test_count:])
+
+    if not train_indices:
+        raise ValueError("Stratified split produced an empty training set; adjust dataset or ratio")
+    if not test_indices:
+        raise ValueError("Stratified split produced an empty test set; adjust dataset or ratio")
+
+    return train_indices, test_indices
+
+
+def get_datasets(name: str, root: str = "./data", download: bool = True, *, seed: int = 42) -> Tuple[Dataset, Dataset, int]:
     """Return train/test datasets and number of classes for ``name``."""
     name = name.lower()
     if name == "cifar10":
@@ -71,6 +132,24 @@ def get_datasets(name: str, root: str = "./data", download: bool = True) -> Tupl
         train = datasets.FashionMNIST(root=root, train=True, transform=_build_transforms(name, True), download=download)
         test = datasets.FashionMNIST(root=root, train=False, transform=_build_transforms(name, False), download=download)
         num_classes = 10
+    elif name == "megaface":
+        data_root = Path(root)
+        candidates = [data_root / "MegaFace", data_root / "megaface"]
+        existing = next((path for path in candidates if path.exists()), None)
+        if existing is None:
+            raise FileNotFoundError(
+                "MegaFace dataset not found. Expected directory named 'MegaFace' or 'megaface' under the data root."
+            )
+        base_dataset = datasets.ImageFolder(str(existing))
+        targets: Sequence[int]
+        if hasattr(base_dataset, "targets"):
+            targets = base_dataset.targets  # type: ignore[assignment]
+        else:
+            targets = [label for _, label in base_dataset.samples]
+        train_indices, test_indices = _stratified_split_indices(targets, 0.1, seed=seed)
+        train = _TransformSubset(base_dataset, train_indices, _build_transforms(name, True))
+        test = _TransformSubset(base_dataset, test_indices, _build_transforms(name, False))
+        num_classes = len(base_dataset.classes)
     else:
         raise ValueError(f"Unsupported dataset: {name}")
     return train, test, num_classes
@@ -142,7 +221,7 @@ class FederatedDataset:
 
 def create_federated_dataloaders(config: FederatedDataConfig) -> FederatedDataset:
     """Instantiate federated train/test loaders according to ``config``."""
-    train_dataset, test_dataset, num_classes = get_datasets(config.dataset, root=config.root)
+    train_dataset, test_dataset, num_classes = get_datasets(config.dataset, root=config.root, seed=config.split_seed)
 
     if config.iid:
         indices_per_client = _iid_partition(len(train_dataset), config.num_clients)

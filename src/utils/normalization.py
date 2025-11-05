@@ -11,6 +11,7 @@ NORMALIZATION_STATS: dict[str, Tuple[Tuple[float, ...], Tuple[float, ...]]] = {
     "cifar100": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     "mnist": ((0.1307,), (0.3081,)),
     "fashionmnist": ((0.1307,), (0.3081,)),
+    "megaface": ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
 }
 
 
