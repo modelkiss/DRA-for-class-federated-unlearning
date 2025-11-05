@@ -978,6 +978,48 @@ def parse_args() -> argparse.Namespace:
         help="对比梯度的指数滑动平均系数。",
     )
     parser.add_argument(
+        "--diffusion-train-contrastive-weight",
+        type=float,
+        default=0.02,
+        help="扩散微调阶段对比分类器损失的权重系数。",
+    )
+    parser.add_argument(
+        "--diffusion-train-contrastive-interval",
+        type=int,
+        default=2,
+        help="扩散微调阶段插入对比损失的步频 (>=1)。",
+    )
+    parser.add_argument(
+        "--diffusion-pretrain-batches",
+        type=int,
+        default=4,
+        help="使用测试集预热扩散模型时采样的批次数。",
+    )
+    parser.add_argument(
+        "--diffusion-pretrain-epochs",
+        type=int,
+        default=1,
+        help="扩散模型预热的迭代轮次。",
+    )
+    parser.add_argument(
+        "--diffusion-pretrain-lr",
+        type=float,
+        default=5e-5,
+        help="扩散模型预热阶段使用的学习率。",
+    )
+    parser.add_argument(
+        "--diffusion-pretrain-batch-size",
+        type=int,
+        default=None,
+        help="扩散模型预热时的批量大小（缺省时沿用微调批量）。",
+    )
+    parser.add_argument(
+        "--diffusion-pretrain-max-steps",
+        type=int,
+        default=0,
+        help="扩散预热阶段的最大优化步数，0 表示不限制。",
+    )
+    parser.add_argument(
         "--reconstruction-refine-steps",
         type=int,
         default=5,
@@ -1222,6 +1264,11 @@ def main() -> None:
         contrastive_frequency=args.diffusion_contrastive_frequency,
         contrastive_clip=args.diffusion_contrastive_clip,
         contrastive_ema=args.diffusion_contrastive_ema,
+        contrastive_train_weight=args.diffusion_train_contrastive_weight,
+        contrastive_train_interval=args.diffusion_train_contrastive_interval,
+        pretrain_epochs=args.diffusion_pretrain_epochs,
+        pretrain_batch_size=args.diffusion_pretrain_batch_size,
+        pretrain_max_steps=None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
     )
     try:
         diffusion = DiffusionReconstructor(diffusion_config)
@@ -1247,10 +1294,51 @@ def main() -> None:
         diffusion_config.contrastive_ema,
     )
     LOGGER.info(
+        "扩散微调对比项：权重=%.4f, 步频=%d",
+        diffusion_config.contrastive_train_weight,
+        diffusion_config.contrastive_train_interval,
+    )
+    LOGGER.info(
         "重建细化配置：梯度引导步数=%d, 步长=%.3f",
         args.reconstruction_refine_steps,
         args.reconstruction_guidance_weight,
     )
+
+    pretrain_tensor: torch.Tensor | None = None
+    if args.diffusion_pretrain_batches > 0:
+        LOGGER.info(
+            "扩散预热阶段：计划使用测试集前 %d 个批次进行预训练。",
+            args.diffusion_pretrain_batches,
+        )
+        collected_batches: list[torch.Tensor] = []
+        with torch.no_grad():
+            for batch_idx, (inputs, _) in enumerate(federated_dataset.test_loader):
+                if batch_idx >= args.diffusion_pretrain_batches:
+                    break
+                samples = inputs.detach()
+                try:
+                    stats = get_normalization_stats(args.dataset)
+                    samples = denormalize(samples, stats)
+                except KeyError:
+                    pass
+                collected_batches.append(samples.clamp(0.0, 1.0).cpu())
+        if collected_batches:
+            pretrain_tensor = torch.cat(collected_batches, dim=0)
+        else:
+            LOGGER.warning("测试集样本不足，扩散预热阶段已被跳过。")
+
+    if pretrain_tensor is not None and pretrain_tensor.numel() > 0:
+        diffusion.pretrain(
+            pretrain_tensor,
+            epochs=args.diffusion_pretrain_epochs,
+            learning_rate=args.diffusion_pretrain_lr,
+            batch_size=args.diffusion_pretrain_batch_size or args.diffusion_train_batch_size,
+            max_steps=None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
+            classifier_before=pre_forgetting_model,
+            classifier_after=post_forgetting_model,
+            target_class=args.target_class,
+            dataset=args.dataset,
+        )
 
     penalties: dict[int, float] = {}
     reinference_count = 0
@@ -1405,6 +1493,10 @@ def main() -> None:
             class_label=class_label,
             batch_size=args.diffusion_train_batch_size,
             max_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
+            classifier_before=pre_forgetting_model,
+            classifier_after=post_forgetting_model,
+            target_class=inference.predicted_class,
+            dataset=args.dataset,
         )
 
         pre_forgetting_model = pre_forgetting_model.to(device)
@@ -1604,6 +1696,8 @@ def main() -> None:
             "prior_blend_weight": args.diffusion_prior_blend,
             "noise_offset": args.diffusion_latent_noise,
             "strength": args.diffusion_strength,
+            "contrastive_weight": args.diffusion_train_contrastive_weight,
+            "contrastive_interval": args.diffusion_train_contrastive_interval,
         },
         "contrastive_guidance": {
             "step": args.diffusion_contrastive_step,
@@ -1611,6 +1705,14 @@ def main() -> None:
             "frequency": args.diffusion_contrastive_frequency,
             "clip": args.diffusion_contrastive_clip,
             "ema": args.diffusion_contrastive_ema,
+        },
+        "diffusion_pretrain": {
+            "batches": args.diffusion_pretrain_batches,
+            "epochs": args.diffusion_pretrain_epochs,
+            "learning_rate": args.diffusion_pretrain_lr,
+            "batch_size": args.diffusion_pretrain_batch_size or args.diffusion_train_batch_size,
+            "max_steps": None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
+            "records": diffusion.pretrain_records,
         },
         "reconstruction_accuracy_before": successful_acc_before,
         "reconstruction_accuracy_after": successful_acc_after,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 import inspect
 from typing import Optional, Sequence
@@ -38,6 +39,11 @@ class DiffusionConfig:
     contrastive_frequency: int = 2
     contrastive_clip: float = 1.5
     contrastive_ema: float = 0.85
+    contrastive_train_weight: float = 0.02
+    contrastive_train_interval: int = 2
+    pretrain_epochs: int = 1
+    pretrain_batch_size: Optional[int] = None
+    pretrain_max_steps: Optional[int] = None
 
     # LoRA settings
     use_lora: bool = False           # OFF by default
@@ -75,6 +81,80 @@ class DiffusionReconstructor:
         self._trained_steps: int = 0
         self._prior_image_bank: list[torch.Tensor] = []
         self._ema_latent_update: torch.Tensor | None = None
+        self._pretrain_records: list[dict[str, float]] = []
+
+    # ------------------------------------------------------------------
+    # High-level preparation utilities
+    # ------------------------------------------------------------------
+
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        scale = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
+        decoded = self.pipeline.vae.decode(latents / scale).sample
+        return ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
+
+    def _normalize_for_classifier(self, images: torch.Tensor, dataset: str | None) -> torch.Tensor:
+        if dataset is None:
+            return images
+        try:
+            mean, std = get_normalization_stats(dataset)
+        except KeyError:
+            return images
+
+        channels = len(mean)
+        if images.dim() != 4:
+            raise ValueError("Classifier inputs must have shape (B,C,H,W)")
+        current_channels = images.size(1)
+        if current_channels != channels:
+            if channels == 1:
+                images = images.mean(dim=1, keepdim=True)
+            elif current_channels == 1:
+                images = images.repeat(1, channels, 1, 1)
+            elif current_channels > channels:
+                images = images[:, :channels]
+            else:
+                images = F.interpolate(images, size=images.shape[-2:], mode="bilinear", align_corners=False)
+                images = images.repeat(1, math.ceil(channels / current_channels), 1, 1)
+                images = images[:, :channels]
+
+        device = images.device
+        dtype = images.dtype
+        mean_tensor = torch.tensor(mean, device=device, dtype=dtype).view(1, channels, 1, 1)
+        std_tensor = torch.tensor(std, device=device, dtype=dtype).view(1, channels, 1, 1)
+        return (images - mean_tensor) / std_tensor
+
+    def _noise_scale(self, step: int, timestep: int) -> float:
+        scheduler = self.pipeline.scheduler
+        try:
+            sigmas = getattr(scheduler, "sigmas")
+            if sigmas is not None:
+                index = min(step, len(sigmas) - 1)
+                sigma_val = float(sigmas[index])
+                if hasattr(sigmas, "max"):
+                    max_sigma = float(sigmas.max())
+                else:
+                    max_sigma = float(max(sigmas))
+                return float(sigma_val / (max_sigma + 1e-6))
+        except Exception:
+            pass
+
+        alphas = getattr(scheduler, "alphas_cumprod", None)
+        if alphas is not None and len(alphas) > 0:
+            idx = int(timestep)
+            idx = max(0, min(idx, len(alphas) - 1))
+            alpha = float(alphas[idx])
+            return float(max(0.0, min(1.0, (1.0 - alpha) ** 0.5)))
+
+        total = max(1, int(self.config.num_inference_steps))
+        return 1.0 - float(step) / float(total)
+
+    def _apply_clip(self, update: torch.Tensor) -> torch.Tensor:
+        clip_norm = float(max(0.0, self.config.contrastive_clip))
+        if clip_norm == 0.0:
+            return update
+        flat = update.view(update.size(0), -1)
+        norms = flat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+        factors = (clip_norm / norms).clamp(max=1.0)
+        return update * factors.view(-1, 1, 1, 1)
 
     def reset_guidance(self) -> None:
         """Reset any sensitive feature guidance applied to the pipeline."""
@@ -88,6 +168,7 @@ class DiffusionReconstructor:
         self._trained_steps = 0
         self._prior_image_bank = []
         self._ema_latent_update = None
+        self._pretrain_records = []
 
     def fine_tune_with_guidance(
         self,
@@ -99,6 +180,10 @@ class DiffusionReconstructor:
         class_label: str | None = None,
         batch_size: Optional[int] = None,
         max_steps: Optional[int] = None,
+        classifier_before: torch.nn.Module | None = None,
+        classifier_after: torch.nn.Module | None = None,
+        target_class: int | None = None,
+        dataset: str | None = None,
     ) -> None:
         """Record sensitive features without applying textual guidance."""
 
@@ -116,6 +201,8 @@ class DiffusionReconstructor:
             "learning_rate": learning_rate,
             "mean_score": mean_score,
             "train_steps": 0.0,
+            "contrastive_weight": float(self.config.contrastive_train_weight),
+            "contrastive_interval": int(max(1, self.config.contrastive_train_interval)),
         }
         self._trained_steps = 0
         self._ema_latent_update = None
@@ -124,6 +211,22 @@ class DiffusionReconstructor:
             clipped = images.detach().cpu().clamp(0.0, 1.0)
             self._prior_image_bank = [tensor.clone() for tensor in clipped]
             self._latent_mask_cache = None
+            steps = self._train_on_samples(
+                clipped,
+                prompt=class_label or "",
+                epochs=epochs,
+                learning_rate=learning_rate,
+                batch_size=batch_size or self.config.train_batch_size or 1,
+                max_steps=max_steps,
+                classifier_before=classifier_before,
+                classifier_after=classifier_after,
+                target_class=target_class,
+                dataset=dataset,
+                contrastive_interval=self.config.contrastive_train_interval,
+            )
+            self._guidance_hparams["train_steps"] = float(steps)
+        else:
+            self.logger.warning("未提供目标类别样本，扩散微调跳过仅保留对比引导。")
         self.logger.info("文本提示已禁用：跳过扩散模型的提示语微调，仅保留空间掩模与梯度细化。")
 
     def ingest_priors(self, samples: torch.Tensor, dataset: str) -> None:
@@ -147,6 +250,74 @@ class DiffusionReconstructor:
         samples = samples.detach().cpu().clamp(0.0, 1.0)
         self._prior_image_bank = [tensor.clone() for tensor in samples]
         self._latent_mask_cache = None
+
+    @property
+    def pretrain_records(self) -> list[dict[str, float]]:
+        """Return diffusion pretraining log entries for external reporting."""
+
+        return list(self._pretrain_records)
+
+    def pretrain(
+        self,
+        images: torch.Tensor,
+        *,
+        epochs: Optional[int] = None,
+        learning_rate: float = 5e-5,
+        batch_size: Optional[int] = None,
+        max_steps: Optional[int] = None,
+        classifier_before: torch.nn.Module | None = None,
+        classifier_after: torch.nn.Module | None = None,
+        target_class: int | None = None,
+        dataset: str | None = None,
+    ) -> int:
+        """Warm up the diffusion UNet on held-out test images."""
+
+        if images is None or images.numel() == 0:
+            self.logger.warning("扩散预训练阶段未提供样本，跳过预热。")
+            return 0
+
+        epochs = epochs or max(1, int(self.config.pretrain_epochs))
+        batch_size = (
+            batch_size
+            or self.config.pretrain_batch_size
+            or self.config.train_batch_size
+            or 1
+        )
+        if max_steps is None:
+            max_steps = self.config.pretrain_max_steps
+
+        images = images.clamp(0.0, 1.0)
+        if images.size(1) == 1:
+            images = images.repeat(1, 3, 1, 1)
+
+        self.logger.info(
+            "扩散模型预训练：样本=%d, epochs=%d, lr=%.2e, batch=%d", images.size(0), epochs, learning_rate, batch_size
+        )
+
+        steps = self._train_on_samples(
+            images,
+            prompt="",
+            epochs=epochs,
+            learning_rate=learning_rate,
+            batch_size=batch_size,
+            max_steps=max_steps,
+            classifier_before=classifier_before,
+            classifier_after=classifier_after,
+            target_class=target_class,
+            dataset=dataset,
+            contrastive_interval=self.config.contrastive_train_interval,
+        )
+
+        self._pretrain_records.append(
+            {
+                "steps": float(steps),
+                "epochs": float(epochs),
+                "learning_rate": float(learning_rate),
+                "batch_size": float(batch_size),
+            }
+        )
+
+        return steps
 
     def set_heatmap_guidance(self, mask: torch.Tensor | None) -> None:
         """设置热力图掩模用于后处理强化。"""
@@ -255,57 +426,46 @@ class DiffusionReconstructor:
     ):
         frequency = guidance_frequency if guidance_frequency is not None else self.config.contrastive_frequency
         frequency = max(1, int(frequency))
+        total_steps = max(1, int(self.config.num_inference_steps))
 
-        scale = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
-        stats = get_normalization_stats(dataset)
+        classifier_before = classifier_before.to(self.config.device).eval()
+        classifier_after = classifier_after.to(self.config.device).eval()
+        for module in (classifier_before, classifier_after):
+            for param in module.parameters():
+                param.requires_grad_(False)
 
-        def _normalize_for_classifier(images: torch.Tensor) -> torch.Tensor:
-            mean = torch.tensor(stats[0], device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
-            std = torch.tensor(stats[1], device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
-            return (images - mean) / std
-
-        def _decode_latents(latents: torch.Tensor) -> torch.Tensor:
-            decoded = self.pipeline.vae.decode(latents / scale).sample
-            return ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-
-        def _step_size(step: int, total: int) -> float:
-            if total <= 1:
-                return float(self.config.contrastive_min_step)
-            ratio = step / float(total - 1)
-            max_step = float(self.config.contrastive_step)
-            min_step = float(self.config.contrastive_min_step)
-            return float((1.0 - ratio) * max_step + ratio * min_step)
-
-        def _apply_clip(update: torch.Tensor) -> torch.Tensor:
-            clip_norm = float(max(0.0, self.config.contrastive_clip))
-            if clip_norm == 0.0:
-                return update
-            flat = update.view(update.size(0), -1)
-            norms = flat.norm(dim=1, keepdim=True).clamp(min=1e-6)
-            factors = (clip_norm / norms).clamp(max=1.0)
-            return update * factors.view(-1, 1, 1, 1)
+        def _step_size(step: int) -> float:
+            if total_steps <= 1:
+                base = float(self.config.contrastive_min_step)
+            else:
+                ratio = step / float(total_steps - 1)
+                max_step = float(self.config.contrastive_step)
+                min_step = float(self.config.contrastive_min_step)
+                base = float((1.0 - ratio) * max_step + ratio * min_step)
+            noise_scale = self._noise_scale(step, step)
+            return max(1e-4, base * max(0.1, noise_scale))
 
         def callback(step: int, timestep: int, latents: torch.Tensor) -> None:
             if step % frequency != 0:
                 return
+
             if not latents.requires_grad:
                 latents.requires_grad_(True)
+
             with torch.enable_grad():
-                decoded = _decode_latents(latents)
-                if decoded.dtype != torch.float32:
-                    decoded = decoded.to(torch.float32)
-                normed = _normalize_for_classifier(decoded)
+                decoded = self._decode_latents(latents)
+                normed = self._normalize_for_classifier(decoded.to(torch.float32), dataset)
                 logits_before = classifier_before(normed)
                 logits_after = classifier_after(normed)
                 contrast = (logits_before[:, target_class] - logits_after[:, target_class]).sum()
-                grad = torch.autograd.grad(contrast, latents)[0]
+                grad = torch.autograd.grad(contrast, latents, retain_graph=False)[0]
 
             mask = self._latent_guidance_mask(latents.shape, latents.device, latents.dtype)
             if mask is not None:
                 grad = grad * (1.0 + mask)
 
             grad = grad / grad.view(grad.size(0), -1).norm(dim=1, keepdim=True).clamp(min=1e-6).view(-1, 1, 1, 1)
-            grad = _apply_clip(grad)
+            grad = self._apply_clip(grad)
 
             ema = float(max(0.0, min(0.999, self.config.contrastive_ema)))
             if ema > 0.0:
@@ -317,7 +477,7 @@ class DiffusionReconstructor:
                     )
                 grad = self._ema_latent_update
 
-            step_size = _step_size(step, int(self.config.num_inference_steps))
+            step_size = _step_size(step)
             update = grad * step_size
 
             with torch.no_grad():
@@ -420,6 +580,11 @@ class DiffusionReconstructor:
         learning_rate: float,
         batch_size: int,
         max_steps: Optional[int],
+        classifier_before: torch.nn.Module | None = None,
+        classifier_after: torch.nn.Module | None = None,
+        target_class: int | None = None,
+        dataset: str | None = None,
+        contrastive_interval: Optional[int] = None,
     ) -> int:
         """执行一次基于遗忘样本的扩散模型微调。"""
 
@@ -427,6 +592,8 @@ class DiffusionReconstructor:
         dtype = self.pipeline.unet.dtype
         images = images.to(device=device, dtype=dtype)
         images = images.clamp(0.0, 1.0)
+        if images.size(1) == 1:
+            images = images.repeat(1, 3, 1, 1)
 
         trainable_params = None
 
@@ -458,6 +625,23 @@ class DiffusionReconstructor:
                     trainable_params.append(module.bias)
 
         optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
+
+        contrastive_interval = contrastive_interval or self.config.contrastive_train_interval
+        contrastive_interval = max(1, int(contrastive_interval))
+        contrastive_active = (
+            classifier_before is not None
+            and classifier_after is not None
+            and target_class is not None
+            and dataset is not None
+            and float(self.config.contrastive_train_weight) > 0.0
+        )
+
+        if contrastive_active:
+            classifier_before = classifier_before.to(device).eval()
+            classifier_after = classifier_after.to(device).eval()
+            for module in (classifier_before, classifier_after):
+                for param in module.parameters():
+                    param.requires_grad_(False)
 
         total_steps = 0
         num_samples = images.size(0)
@@ -496,6 +680,16 @@ class DiffusionReconstructor:
                 ).sample
                 loss = self._weighted_mse(noise_pred, noise)
 
+                if contrastive_active and total_steps % contrastive_interval == 0:
+                    approx_latents = noisy_latents - noise_pred
+                    decoded = self._decode_latents(approx_latents)
+                    normed = self._normalize_for_classifier(decoded.to(torch.float32), dataset)
+                    logits_before = classifier_before(normed)
+                    logits_after = classifier_after(normed)
+                    contrast = logits_before[:, target_class] - logits_after[:, target_class]
+                    contrastive_loss = -contrast.mean()
+                    loss = loss + float(self.config.contrastive_train_weight) * contrastive_loss
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -508,6 +702,8 @@ class DiffusionReconstructor:
         self.pipeline.unet.eval()
         for p in self.pipeline.unet.parameters():
             p.requires_grad = False
+
+        self._trained_steps += total_steps
 
         return total_steps
 
