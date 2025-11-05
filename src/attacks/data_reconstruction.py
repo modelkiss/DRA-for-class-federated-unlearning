@@ -23,7 +23,7 @@ class DiffusionConfig:
     """Configuration for diffusion-based reconstruction."""
 
     model_id: str
-    guidance_scale: float = 7.5
+    guidance_scale: float = 0.0
     num_inference_steps: int = 50
     height: Optional[int] = None
     width: Optional[int] = None
@@ -63,7 +63,8 @@ class DiffusionReconstructor:
             target_dtype = torch.float32
         self.pipeline.to(config.device, dtype=target_dtype)
         self.config.dtype = target_dtype
-        self._base_guidance_scale = float(config.guidance_scale)
+        self._base_guidance_scale = 0.0
+        self.config.guidance_scale = 0.0
         self._guided_prompt_suffix: str = ""
         self._active_features: list[SensitiveFeature] = []
         self._guidance_hparams: dict[str, float] = {}
@@ -95,67 +96,30 @@ class DiffusionReconstructor:
         batch_size: Optional[int] = None,
         max_steps: Optional[int] = None,
     ) -> None:
-        """Heuristically adapt prompts/guidance according to sensitive features."""
+        """Record sensitive features without applying textual guidance."""
 
-        if not features:
-            self._active_features = []
-            self._guided_prompt_suffix = ""
-            self.config.guidance_scale = self._base_guidance_scale
-            return
-
-        self.config.guidance_scale = self._base_guidance_scale
-        self._guided_prompt_suffix = ""
         self._active_features = list(features)
-        keywords = []
-        scores = []
-        for feature in features:
-            token = feature.name.replace("_", " ")
-            keywords.append(token)
-            scores.append(abs(float(feature.score)))
+        self._guided_prompt_suffix = ""
+        self.config.guidance_scale = 0.0
 
-        if keywords:
-            unique_keywords = []
-            seen = set()
-            for keyword in keywords:
-                if keyword in seen:
-                    continue
-                seen.add(keyword)
-                unique_keywords.append(keyword)
-            self._guided_prompt_suffix = ", ".join(unique_keywords)
+        mean_score = 0.0
+        if features:
+            scores = [abs(float(feature.score)) for feature in features]
+            mean_score = float(np.mean(scores)) if scores else 0.0
 
-        if scores:
-            mean_score = float(np.mean(scores))
-            scale_delta = 0.1 * np.tanh(mean_score * max(1, epochs))
-            self.config.guidance_scale = float(self._base_guidance_scale * (1.0 + scale_delta))
-
-        # Store guidance metadata for potential reproducibility.
         self._guidance_hparams = {
             "epochs": epochs,
             "learning_rate": learning_rate,
-            "mean_score": float(np.mean(scores)) if scores else 0.0,
+            "mean_score": mean_score,
+            "train_steps": 0.0,
         }
+        self._trained_steps = 0
 
-        if images is None or images.numel() == 0:
-            return
-
-        prompt_label = class_label or (self._active_features[0].name if self._active_features else "target")
-        prompt = self.config.prompt_template.format(label=prompt_label)
-        if self._guided_prompt_suffix:
-            prompt = f"{prompt}, {self._guided_prompt_suffix}"
-
-        batch_size = batch_size or self.config.train_batch_size
-        max_steps = max_steps or self.config.max_train_steps
-
-        steps = self._train_on_samples(
-            images,
-            prompt,
-            epochs=epochs,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            max_steps=max_steps,
-        )
-        self._trained_steps += steps
-        self._guidance_hparams["train_steps"] = float(self._trained_steps)
+        if images is not None and images.numel() > 0:
+            clipped = images.detach().cpu().clamp(0.0, 1.0)
+            self._prior_image_bank = [tensor.clone() for tensor in clipped]
+            self._latent_mask_cache = None
+        self.logger.info("文本提示已禁用：跳过扩散模型的提示语微调，仅保留空间掩模与梯度细化。")
 
     def ingest_priors(self, samples: torch.Tensor, dataset: str) -> None:
         """将真实样本转换为潜空间均值，作为采样先验。"""
@@ -200,26 +164,16 @@ class DiffusionReconstructor:
         init_images: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Generate `num_samples` images in a single batched call to avoid shape mismatches."""
-        label = class_label or str(target_class)
-        prompt = self.config.prompt_template.format(label=label)
-        if self._guided_prompt_suffix:
-            prompt = f"{prompt}, {self._guided_prompt_suffix}"
-
-        # Prepare a list of identical prompts to match batch size
-        prompts = [prompt] * int(num_samples)
-        negative_prompts = None
-        if self.config.negative_prompt is not None:
-            negative_prompts = [self.config.negative_prompt] * int(num_samples)
+        # 文本提示被禁用：用空字符串占位，依赖空间掩模与后续梯度细化。
+        prompts = [""] * int(num_samples)
 
         images = self._prepare_initial_images(init_images, num_samples)
 
         kwargs = {
-            "guidance_scale": self.config.guidance_scale,
+            "guidance_scale": 0.0,
             "num_inference_steps": self.config.num_inference_steps,
             "strength": self.config.strength,
         }
-        if negative_prompts is not None:
-            kwargs["negative_prompt"] = negative_prompts
 
         call_sig = inspect.signature(self.pipeline.__call__)
         if "image" not in call_sig.parameters:
@@ -228,8 +182,6 @@ class DiffusionReconstructor:
         pipeline_prompt: list[str] | str = prompts
         if num_samples == 1:
             pipeline_prompt = prompts[0]
-            if negative_prompts is not None:
-                kwargs["negative_prompt"] = negative_prompts[0]
 
         result = self.pipeline(
             pipeline_prompt,
