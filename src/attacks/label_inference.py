@@ -503,55 +503,34 @@ def infer_forgotten_label(
     center_norm = _min_max_normalize(center_tensor)
     edge_norm = _min_max_normalize(edge_tensor)
 
-    combined_tensor = accuracy_norm + 0.5 * center_norm + 0.5 * edge_norm
-
-    combined_scores: dict[int, float] = {}
+    normalized_components: dict[int, dict[str, float]] = {}
     for index, cls in enumerate(valid_classes):
-        combined = float(combined_tensor[index].item())
-        combined_scores[cls] = combined
-        candidate_details[cls] = {
-            **heatmap_details.get(cls, {}),
-            "combined_score": combined,
+        normalized_components[cls] = {
+            "accuracy_norm": float(accuracy_norm[index].item()),
+            "center_norm": float(center_norm[index].item()),
+            "edge_norm": float(edge_norm[index].item()),
         }
-        LOGGER.info(
-            "  类别 %d -> 归一化指标：准确率 %.4f, 中心偏移 %.4f, 边缘关注 %.4f, 综合得分 %.4f",
-            cls,
-            accuracy_norm[index].item(),
-            center_norm[index].item(),
-            edge_norm[index].item(),
-            combined,
-        )
-
-    second_stage_count = min(3, len(valid_classes))
-    second_stage_candidates = sorted(
-        valid_classes,
-        key=lambda cls: combined_scores.get(cls, 0.0),
-        reverse=True,
-    )[:second_stage_count]
-
-    LOGGER.info("第二阶段候选类别（综合得分最高的 %d 个）：%s", second_stage_count, second_stage_candidates)
 
     parameter_name, parameter_delta = _select_high_level_parameter(before, after)
     similarity_scores: dict[int, float] = {}
 
-    score_vector = torch.full((num_classes,), fill_value=-1e9, device=device)
+    LOGGER.info("第二阶段候选类别（梯度相似度分析）共 %d 个：%s", len(valid_classes), valid_classes)
 
     if parameter_name is None or parameter_delta is None:
-        LOGGER.warning("未找到高层参数差异，直接依据综合热力图得分进行判断。")
+        LOGGER.warning("未找到高层参数差异，梯度相似度得分将置零。")
         for cls in valid_classes:
-            score_vector[cls] = combined_scores.get(cls, 0.0)
-            similarity_scores[cls] = combined_scores.get(cls, 0.0)
+            similarity_scores[cls] = 0.0
     else:
         LOGGER.info(
             "选择高层参数 %s 进行梯度相似度分析 (Δ范数=%.4f)",
             parameter_name,
             float(parameter_delta.norm().item()),
         )
-        for cls in second_stage_candidates:
+        for cls in valid_classes:
             samples = sample_bank.get(cls)
             if samples is None or samples.numel() == 0:
                 LOGGER.warning("类别 %d 缺少样本，无法计算梯度相似度。", cls)
-                similarity_scores[cls] = float("-inf")
+                similarity_scores[cls] = 0.0
                 continue
             inputs = samples[:heatmap_samples].to(device)
             avg_before = _average_parameter_gradient(before, inputs, cls, parameter_name)
@@ -565,15 +544,34 @@ def infer_forgotten_label(
                 similarity = float(
                     F.cosine_similarity(delta_flat.unsqueeze(0), grad_flat.unsqueeze(0), dim=1).item()
                 )
-            similarity_scores[cls] = similarity
-            score_vector[cls] = similarity
-            LOGGER.info("  类别 %d -> 参数梯度相似度 %.4f", cls, similarity)
+            # 将余弦相似度映射到 [0, 1]
+            similarity_scores[cls] = float(((similarity + 1.0) / 2.0))
+            LOGGER.info("  类别 %d -> 参数梯度相似度 %.4f (归一化=%.4f)", cls, similarity, similarity_scores[cls])
 
-        for cls in valid_classes:
-            if score_vector[cls].item() == -1e9:
-                # 对未进入第二阶段的类别保留综合热力图得分以备惩罚机制使用
-                score_vector[cls] = combined_scores.get(cls, 0.0)
-                similarity_scores.setdefault(cls, combined_scores.get(cls, 0.0))
+    score_vector = torch.full((num_classes,), fill_value=-1e9, device=device)
+
+    for cls in valid_classes:
+        components = normalized_components[cls]
+        sim_score = similarity_scores.get(cls, 0.0)
+        final_score = components["accuracy_norm"] + components["center_norm"] + components["edge_norm"] + sim_score
+        score_vector[cls] = final_score
+        candidate_details[cls] = {
+            **heatmap_details.get(cls, {}),
+            "accuracy_norm": components["accuracy_norm"],
+            "center_norm": components["center_norm"],
+            "edge_norm": components["edge_norm"],
+            "similarity_norm": sim_score,
+            "final_score": final_score,
+        }
+        LOGGER.info(
+            "  类别 %d -> 归一化指标：准确率 %.4f, 中心偏移 %.4f, 边缘关注 %.4f, 梯度相似度 %.4f, 综合得分 %.4f",
+            cls,
+            components["accuracy_norm"],
+            components["center_norm"],
+            components["edge_norm"],
+            sim_score,
+            final_score,
+        )
 
     if transform is not None:
         score_vector = transform(score_vector)
@@ -584,6 +582,8 @@ def infer_forgotten_label(
         "标签推理综合得分: %s",
         {cls: float(score_vector[cls].item()) for cls in valid_classes},
     )
+
+    second_stage_candidates = tuple(valid_classes)
 
     return LabelInferenceResult(
         predicted_class=predicted,
