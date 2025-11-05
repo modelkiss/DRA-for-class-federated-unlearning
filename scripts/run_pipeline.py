@@ -16,7 +16,6 @@ from torch.utils.data import Subset
 
 from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
 from src.attacks.label_inference import LabelInferenceResult, SensitiveFeature, infer_forgotten_label
-from src.attacks.sensitive_feature_inference import infer_sensitive_features
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.aggregation import AggregationConfig
@@ -286,20 +285,6 @@ def _parse_level_thresholds(raw: str | None) -> list[float] | None:
         return [float(token) for token in tokens]
     except ValueError as exc:  # pragma: no cover - defensive programming
         raise ValueError("AHSecAgg level thresholds must be numeric values") from exc
-
-
-def _parse_sfi_thresholds(raw: str | None) -> tuple[float, ...]:
-    default = (0.5, 0.7)
-    if raw is None:
-        return default
-    tokens = [token.strip() for token in raw.split(",") if token.strip()]
-    if not tokens:
-        return default
-    try:
-        values = tuple(float(token) for token in tokens)
-    except ValueError as exc:  # pragma: no cover - defensive programming
-        raise ValueError("Sensitive feature thresholds must be numeric values") from exc
-    return values if values else default
 
 
 def _resolve_aggregation(args: argparse.Namespace) -> ResolvedAggregation:
@@ -899,17 +884,6 @@ def parse_args() -> argparse.Namespace:
         help="边缘纹理分析所采用的边界宽度占比 (0-0.5)。",
     )
     parser.add_argument(
-        "--sfi-top-k-patches",
-        type=int,
-        default=8,
-        help="敏感特征定位阶段输出的最高得分 patch 数量。",
-    )
-    parser.add_argument(
-        "--sfi-thresholds",
-        default="0.5,0.7",
-        help="敏感特征定位的热力图阈值列表 (归一化比例, 逗号分隔)。",
-    )
-    parser.add_argument(
         "--diffusion-model-id",
         default="runwayml/stable-diffusion-v1-5",
         help="Pretrained diffusion pipeline identifier (diffusers).",
@@ -974,6 +948,36 @@ def parse_args() -> argparse.Namespace:
         help="图生图初始扰动在掩模外注入的噪声幅度。",
     )
     parser.add_argument(
+        "--diffusion-contrastive-step",
+        type=float,
+        default=0.12,
+        help="对比引导在早期去噪步中的学习率。",
+    )
+    parser.add_argument(
+        "--diffusion-contrastive-min-step",
+        type=float,
+        default=0.02,
+        help="对比引导在末尾去噪步中的最小学习率。",
+    )
+    parser.add_argument(
+        "--diffusion-contrastive-frequency",
+        type=int,
+        default=2,
+        help="执行分类器对比引导的步频（每多少步一次）。",
+    )
+    parser.add_argument(
+        "--diffusion-contrastive-clip",
+        type=float,
+        default=1.5,
+        help="对比梯度的全局范数裁剪阈值。",
+    )
+    parser.add_argument(
+        "--diffusion-contrastive-ema",
+        type=float,
+        default=0.85,
+        help="对比梯度的指数滑动平均系数。",
+    )
+    parser.add_argument(
         "--reconstruction-refine-steps",
         type=int,
         default=5,
@@ -999,12 +1003,6 @@ def main() -> None:
         args.inference_heatmap_samples,
         args.inference_heatmap_border_ratio,
     )
-
-    try:
-        sfi_thresholds = _parse_sfi_thresholds(args.sfi_thresholds)
-    except ValueError as exc:
-        LOGGER.error("Invalid sensitive feature thresholds: %s", exc)
-        raise SystemExit(str(exc)) from exc
 
     aggregation = _resolve_aggregation(args)
     LOGGER.info(
@@ -1219,6 +1217,11 @@ def main() -> None:
         prior_blend_weight=args.diffusion_prior_blend,
         noise_offset=args.diffusion_latent_noise,
         strength=args.diffusion_strength,
+        contrastive_step=args.diffusion_contrastive_step,
+        contrastive_min_step=args.diffusion_contrastive_min_step,
+        contrastive_frequency=args.diffusion_contrastive_frequency,
+        contrastive_clip=args.diffusion_contrastive_clip,
+        contrastive_ema=args.diffusion_contrastive_ema,
     )
     try:
         diffusion = DiffusionReconstructor(diffusion_config)
@@ -1234,6 +1237,14 @@ def main() -> None:
         "不限" if diffusion_config.max_train_steps is None else diffusion_config.max_train_steps,
         diffusion_config.noise_offset,
         diffusion_config.strength,
+    )
+    LOGGER.info(
+        "对比引导参数：步长(初始)=%.3f, 步长(末尾)=%.3f, 频率=%d, 范数裁剪=%.2f, EMA=%.2f",
+        diffusion_config.contrastive_step,
+        diffusion_config.contrastive_min_step,
+        diffusion_config.contrastive_frequency,
+        diffusion_config.contrastive_clip,
+        diffusion_config.contrastive_ema,
     )
     LOGGER.info(
         "重建细化配置：梯度引导步数=%d, 步长=%.3f",
@@ -1315,38 +1326,20 @@ def main() -> None:
                 break
             user_confirmed_reconstruction = True
 
-        LOGGER.info("链路推进：执行敏感特征推理以定位可视线索……")
-        features, feature_masks = infer_sensitive_features(
-            inference,
-            pre_forgetting_model,
-            post_forgetting_model,
-            device=device,
-            k_patches=args.sfi_top_k_patches,
-            thresholds=sfi_thresholds,
-        )
-        sensitive_features = list(features)
+        LOGGER.info("链路推进：按照指示跳过敏感特征推理，直接基于热力图差异生成掩模。")
+        sensitive_features: list[SensitiveFeature] = []
         inference.sensitive_features = tuple(sensitive_features)
         _log_sensitive_features(sensitive_features)
 
         prior_samples = inference.sample_bank.get(inference.predicted_class, torch.empty(0))
         diffusion.ingest_priors(prior_samples, args.dataset)
         guidance_mask = None
-        if feature_masks:
-            try:
-                stacked_masks = torch.stack(list(feature_masks.values()), dim=0)
-                combined_mask = stacked_masks.amax(dim=0)
-                guidance_mask = _normalize_heatmap(combined_mask.unsqueeze(0))[0]
-                LOGGER.info("敏感特征掩模：使用 %d 个 patch 的并集作为优先引导区域。", len(feature_masks))
-            except RuntimeError as exc:
-                LOGGER.warning("敏感特征掩模合成失败 (%s)，回退至热力图差异掩模。", exc)
-                guidance_mask = None
-        if guidance_mask is None:
-            try:
-                guidance_mask = _build_guidance_mask(inference)
-            except ValueError as exc:
-                LOGGER.warning("构建热力图指导掩模失败：%s，使用全局掩模代替。", exc)
-                shape = INPUT_SHAPES[args.dataset][1:]
-                guidance_mask = torch.ones(shape, dtype=torch.float32)
+        try:
+            guidance_mask = _build_guidance_mask(inference)
+        except ValueError as exc:
+            LOGGER.warning("构建热力图指导掩模失败：%s，使用全局掩模代替。", exc)
+            shape = INPUT_SHAPES[args.dataset][1:]
+            guidance_mask = torch.ones(shape, dtype=torch.float32)
         diffusion.set_heatmap_guidance(guidance_mask)
         LOGGER.info("已将敏感区域掩模注入扩散模型，准备引导微调。")
 
@@ -1414,11 +1407,20 @@ def main() -> None:
             max_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
         )
 
+        pre_forgetting_model = pre_forgetting_model.to(device)
+        post_forgetting_model = post_forgetting_model.to(device)
+        pre_forgetting_model.eval()
+        post_forgetting_model.eval()
+
         candidate_reconstructions = diffusion.reconstruct(
             target_class=inference.predicted_class,
             num_samples=args.reconstructions,
             class_label=class_label,
             init_images=initial_images,
+            classifier_before=pre_forgetting_model,
+            classifier_after=post_forgetting_model,
+            dataset=args.dataset,
+            guidance_frequency=args.diffusion_contrastive_frequency,
         )
 
         expected_shape = INPUT_SHAPES[args.dataset]
@@ -1602,6 +1604,13 @@ def main() -> None:
             "prior_blend_weight": args.diffusion_prior_blend,
             "noise_offset": args.diffusion_latent_noise,
             "strength": args.diffusion_strength,
+        },
+        "contrastive_guidance": {
+            "step": args.diffusion_contrastive_step,
+            "min_step": args.diffusion_contrastive_min_step,
+            "frequency": args.diffusion_contrastive_frequency,
+            "clip": args.diffusion_contrastive_clip,
+            "ema": args.diffusion_contrastive_ema,
         },
         "reconstruction_accuracy_before": successful_acc_before,
         "reconstruction_accuracy_after": successful_acc_after,

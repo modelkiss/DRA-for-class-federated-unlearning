@@ -1,9 +1,7 @@
-"""Diffusion-based reconstruction utilities for unlearning evaluation.
-LoRA is optional and OFF by default to maximize compatibility across diffusers versions.
-Enable by setting DiffusionConfig.use_lora=True.
-"""
+"""Diffusion-based reconstruction utilities with contrastive guidance."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 import inspect
 from typing import Optional, Sequence
@@ -11,7 +9,6 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn.functional as F
-import logging
 from PIL import Image
 
 from .label_inference import SensitiveFeature
@@ -36,6 +33,11 @@ class DiffusionConfig:
     prior_blend_weight: float = 0.3
     noise_offset: float = 0.05
     strength: float = 0.7
+    contrastive_step: float = 0.12
+    contrastive_min_step: float = 0.02
+    contrastive_frequency: int = 2
+    contrastive_clip: float = 1.5
+    contrastive_ema: float = 0.85
 
     # LoRA settings
     use_lora: bool = False           # OFF by default
@@ -72,6 +74,7 @@ class DiffusionReconstructor:
         self._latent_mask_cache: torch.Tensor | None = None
         self._trained_steps: int = 0
         self._prior_image_bank: list[torch.Tensor] = []
+        self._ema_latent_update: torch.Tensor | None = None
 
     def reset_guidance(self) -> None:
         """Reset any sensitive feature guidance applied to the pipeline."""
@@ -84,6 +87,7 @@ class DiffusionReconstructor:
         self._latent_mask_cache = None
         self._trained_steps = 0
         self._prior_image_bank = []
+        self._ema_latent_update = None
 
     def fine_tune_with_guidance(
         self,
@@ -114,6 +118,7 @@ class DiffusionReconstructor:
             "train_steps": 0.0,
         }
         self._trained_steps = 0
+        self._ema_latent_update = None
 
         if images is not None and images.numel() > 0:
             clipped = images.detach().cpu().clamp(0.0, 1.0)
@@ -149,11 +154,13 @@ class DiffusionReconstructor:
         if mask is None or mask.numel() == 0:
             self._heatmap_mask = None
             self._latent_mask_cache = None
+            self._ema_latent_update = None
             return
         if mask.dim() == 2:
             mask = mask.unsqueeze(0)
         self._heatmap_mask = mask.detach().to(self.config.device, dtype=torch.float32).clamp(0.0, 1.0)
         self._latent_mask_cache = None
+        self._ema_latent_update = None
 
     def reconstruct(
         self,
@@ -162,9 +169,13 @@ class DiffusionReconstructor:
         *,
         class_label: str | None = None,
         init_images: torch.Tensor | None = None,
+        classifier_before: torch.nn.Module | None = None,
+        classifier_after: torch.nn.Module | None = None,
+        dataset: str | None = None,
+        guidance_frequency: int | None = None,
     ) -> torch.Tensor:
-        """Generate `num_samples` images in a single batched call to avoid shape mismatches."""
-        # 文本提示被禁用：用空字符串占位，依赖空间掩模与后续梯度细化。
+        """Generate reconstructions with optional contrastive classifier guidance."""
+
         prompts = [""] * int(num_samples)
 
         images = self._prepare_initial_images(init_images, num_samples)
@@ -173,6 +184,7 @@ class DiffusionReconstructor:
             "guidance_scale": 0.0,
             "num_inference_steps": self.config.num_inference_steps,
             "strength": self.config.strength,
+            "callback_steps": 1,
         }
 
         call_sig = inspect.signature(self.pipeline.__call__)
@@ -183,20 +195,36 @@ class DiffusionReconstructor:
         if num_samples == 1:
             pipeline_prompt = prompts[0]
 
+        if classifier_before is not None and classifier_after is not None and dataset is not None:
+            kwargs["callback"] = self._build_contrastive_callback(
+                classifier_before,
+                classifier_after,
+                target_class=target_class,
+                dataset=dataset,
+                guidance_frequency=guidance_frequency,
+            )
+
         result = self.pipeline(
             pipeline_prompt,
             image=images,
+            output_type="pt",
             **kwargs,
         )
 
-        # Convert resulting images to a torch batch (B, 3, H, W)
-        pil_images = result.images
-        imgs = []
-        for img in pil_images:
-            arr = np.array(img, copy=False)
-            t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
-            imgs.append(t)
-        batch = torch.stack(imgs, dim=0)
+        if not hasattr(result, "images"):
+            raise RuntimeError("扩散模型调用未返回图像。")
+
+        batch = result.images
+        if isinstance(batch, list):
+            imgs: list[torch.Tensor] = []
+            for img in batch:
+                if isinstance(img, torch.Tensor):
+                    tensor = img
+                else:
+                    arr = np.array(img, copy=False)
+                    tensor = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+                imgs.append(tensor)
+            batch = torch.stack(imgs, dim=0)
 
         if self._heatmap_mask is not None:
             # Optional post-blend on image space (very light-touch)
@@ -211,6 +239,91 @@ class DiffusionReconstructor:
             batch = batch * (0.5 + 0.5 * mask.unsqueeze(1)) + batch * (1 - mask.unsqueeze(1))
 
         return batch
+
+    # ------------------------------------------------------------------
+    # Contrastive classifier guidance
+    # ------------------------------------------------------------------
+
+    def _build_contrastive_callback(
+        self,
+        classifier_before: torch.nn.Module,
+        classifier_after: torch.nn.Module,
+        *,
+        target_class: int,
+        dataset: str,
+        guidance_frequency: int | None,
+    ):
+        frequency = guidance_frequency if guidance_frequency is not None else self.config.contrastive_frequency
+        frequency = max(1, int(frequency))
+
+        scale = getattr(self.pipeline.vae.config, "scaling_factor", 0.18215)
+        stats = get_normalization_stats(dataset)
+
+        def _normalize_for_classifier(images: torch.Tensor) -> torch.Tensor:
+            mean = torch.tensor(stats[0], device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
+            std = torch.tensor(stats[1], device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
+            return (images - mean) / std
+
+        def _decode_latents(latents: torch.Tensor) -> torch.Tensor:
+            decoded = self.pipeline.vae.decode(latents / scale).sample
+            return ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
+
+        def _step_size(step: int, total: int) -> float:
+            if total <= 1:
+                return float(self.config.contrastive_min_step)
+            ratio = step / float(total - 1)
+            max_step = float(self.config.contrastive_step)
+            min_step = float(self.config.contrastive_min_step)
+            return float((1.0 - ratio) * max_step + ratio * min_step)
+
+        def _apply_clip(update: torch.Tensor) -> torch.Tensor:
+            clip_norm = float(max(0.0, self.config.contrastive_clip))
+            if clip_norm == 0.0:
+                return update
+            flat = update.view(update.size(0), -1)
+            norms = flat.norm(dim=1, keepdim=True).clamp(min=1e-6)
+            factors = (clip_norm / norms).clamp(max=1.0)
+            return update * factors.view(-1, 1, 1, 1)
+
+        def callback(step: int, timestep: int, latents: torch.Tensor) -> None:
+            if step % frequency != 0:
+                return
+            if not latents.requires_grad:
+                latents.requires_grad_(True)
+            with torch.enable_grad():
+                decoded = _decode_latents(latents)
+                if decoded.dtype != torch.float32:
+                    decoded = decoded.to(torch.float32)
+                normed = _normalize_for_classifier(decoded)
+                logits_before = classifier_before(normed)
+                logits_after = classifier_after(normed)
+                contrast = (logits_before[:, target_class] - logits_after[:, target_class]).sum()
+                grad = torch.autograd.grad(contrast, latents)[0]
+
+            mask = self._latent_guidance_mask(latents.shape, latents.device, latents.dtype)
+            if mask is not None:
+                grad = grad * (1.0 + mask)
+
+            grad = grad / grad.view(grad.size(0), -1).norm(dim=1, keepdim=True).clamp(min=1e-6).view(-1, 1, 1, 1)
+            grad = _apply_clip(grad)
+
+            ema = float(max(0.0, min(0.999, self.config.contrastive_ema)))
+            if ema > 0.0:
+                if self._ema_latent_update is None or self._ema_latent_update.shape != grad.shape:
+                    self._ema_latent_update = grad.detach()
+                else:
+                    self._ema_latent_update = (
+                        ema * self._ema_latent_update + (1.0 - ema) * grad.detach()
+                    )
+                grad = self._ema_latent_update
+
+            step_size = _step_size(step, int(self.config.num_inference_steps))
+            update = grad * step_size
+
+            with torch.no_grad():
+                latents.add_(update)
+
+        return callback
 
     # ------------------------------------------------------------------
     # Internal helpers
