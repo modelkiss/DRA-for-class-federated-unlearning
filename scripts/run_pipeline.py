@@ -1366,12 +1366,34 @@ def main() -> None:
             transform=transform,
         )
 
+        LOGGER.info("标签推理阶段：输出各类别遗忘前后准确率对比。")
+        for cls_index in range(inference.per_class_before.numel()):
+            before_val = float(inference.per_class_before[cls_index].item())
+            after_val = float(inference.per_class_after[cls_index].item())
+            LOGGER.info(
+                "  类别 %d -> 遗忘前准确率 %.2f%%, 遗忘后准确率 %.2f%%, 下降 %.2f%%",
+                cls_index,
+                before_val * 100,
+                after_val * 100,
+                (before_val - after_val) * 100,
+            )
+
         LOGGER.info(
             "标签推理第 %d 次 -> 预测类别 %d (真实类别 %d)",
             reinference_count + 1,
             inference.predicted_class,
             args.target_class,
         )
+        if inference.first_stage_candidates:
+            LOGGER.info(
+                "第一阶段候选类别：%s",
+                sorted(int(cls) for cls in inference.first_stage_candidates),
+            )
+        if inference.second_stage_candidates:
+            LOGGER.info(
+                "第二阶段候选类别：%s",
+                sorted(int(cls) for cls in inference.second_stage_candidates),
+            )
         if inference.candidate_details:
             LOGGER.info("候选类别分析：")
             for cls in sorted(inference.candidate_details):
@@ -1753,6 +1775,11 @@ def main() -> None:
         )
         metadata["heatmaps"].update(
             {key: str(path) if path is not None else None for key, path in heatmap_artifacts.items()})
+        saved_paths = [str(path) for path in heatmap_artifacts.values() if path is not None]
+        if saved_paths:
+            LOGGER.info("标签推理热力图已保存至以下目录：%s", saved_paths)
+        else:
+            LOGGER.info("标签推理热力图未生成具体文件，仅更新元数据。")
     else:
         heatmap_artifacts = {}
 
