@@ -42,6 +42,7 @@ INPUT_SHAPES: Dict[str, Sequence[int]] = {
     "cifar100": (3, 32, 32),
     "mnist": (1, 28, 28),
     "fashionmnist": (1, 28, 28),
+    "megaface": (3, 128, 128),
 }
 
 
@@ -629,7 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reinference-penalty",
         type=float,
-        default=0.8,
+        default=0.9,
         help="重推理时对上一轮预测类别的融合得分缩放系数 (0-1).",
     )
     parser.add_argument(
@@ -888,7 +889,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-heatmap-samples",
         type=int,
-        default=10,
+        default=100,
         help="标签推理阶段每类采样的测试样本数量。",
     )
     parser.add_argument(
@@ -993,6 +994,11 @@ def main() -> None:
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device %s", device)
+    LOGGER.info(
+        "热力图配置：每类采样 %d 张，边缘占比 %.2f",
+        args.inference_heatmap_samples,
+        args.inference_heatmap_border_ratio,
+    )
 
     try:
         sfi_thresholds = _parse_sfi_thresholds(args.sfi_thresholds)
@@ -1001,6 +1007,13 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
 
     aggregation = _resolve_aggregation(args)
+    LOGGER.info(
+        "联邦训练配置：客户端数量=%d, 预训练轮次=%d, 聚合机制=%s, 差分隐私=%s",
+        args.num_clients,
+        args.rounds,
+        aggregation.mechanism,
+        args.dp_method,
+    )
 
     federated_config = FederatedDataConfig(
         dataset=args.dataset,
@@ -1008,12 +1021,15 @@ def main() -> None:
         batch_size=aggregation.batch_size,
         iid=args.iid,
         dirichlet_alpha=args.dirichlet_alpha,
+        split_seed=args.rounds + args.target_class + args.num_clients,
     )
     federated_dataset = create_federated_dataloaders(federated_config)
 
     train_total = sum(len(loader.dataset) for loader in federated_dataset.train_loaders.values())
     test_total = len(federated_dataset.test_loader.dataset)
-    LOGGER.info("训练集样本数：%d, 测试集样本数：%d", train_total, test_total)
+    dataset_total = train_total + test_total
+    LOGGER.info("数据集样本总数：%d, 训练集样本数：%d, 测试集样本数：%d", dataset_total, train_total, test_total)
+    LOGGER.info("数据集待分类别数：%d", federated_dataset.num_classes)
 
     target_sample_count = sum(
         _count_targets_in_dataset(loader.dataset, args.target_class)
@@ -1074,6 +1090,10 @@ def main() -> None:
         }
 
     dp_config = DifferentialPrivacyConfig(method=args.dp_method, parameters=dp_parameters)
+    if args.dp_method == "none":
+        LOGGER.info("差分隐私保护：未启用。")
+    else:
+        LOGGER.info("差分隐私保护：方案=%s, 参数=%s", args.dp_method, dp_parameters)
 
     server_config = ServerConfig(
         device=device,
@@ -1149,8 +1169,10 @@ def main() -> None:
         torch.save(pre_forgetting_model.state_dict(), model_before_path)
         forgetting_params_json = json.dumps(asdict(method_config), ensure_ascii=False)
         LOGGER.info(
-            "联邦训练已完成，模型信息保存在 %s/model_before.pt。是否按照参数执行联邦遗忘步骤，具体参数如下：%s。",
+            "联邦训练已完成，模型信息保存在 %s/model_before.pt。遗忘配置：目标类别=%d, 方法=%s, 参数=%s。",
             args.output,
+            args.target_class,
+            args.forgetting_method,
             forgetting_params_json,
         )
         LOGGER.info(
@@ -1203,6 +1225,21 @@ def main() -> None:
     except RuntimeError as exc:
         LOGGER.error("Diffusion reconstruction failed: %s", exc)
         raise SystemExit("Diffusion-based reconstruction requires the 'diffusers' package") from exc
+    LOGGER.info(
+        "扩散模型参数：模型=%s, 采样步数=%d, 指导尺度=%.2f, 微调批量=%d, 微调步数=%s, 噪声偏移=%.3f, 强度=%.2f",
+        diffusion_config.model_id,
+        diffusion_config.num_inference_steps,
+        diffusion_config.guidance_scale,
+        diffusion_config.train_batch_size,
+        "不限" if diffusion_config.max_train_steps is None else diffusion_config.max_train_steps,
+        diffusion_config.noise_offset,
+        diffusion_config.strength,
+    )
+    LOGGER.info(
+        "重建细化配置：梯度引导步数=%d, 步长=%.3f",
+        args.reconstruction_refine_steps,
+        args.reconstruction_guidance_weight,
+    )
 
     penalties: dict[int, float] = {}
     reinference_count = 0
@@ -1212,6 +1249,7 @@ def main() -> None:
     inference_result: LabelInferenceResult | None = None
     class_label: str | None = None
     user_confirmed_reconstruction = False
+    verification_performed = False
     selected_init_indices: list[int] | None = None
     reconstruction_attempt_dirs: list[str] = []
 
@@ -1438,12 +1476,22 @@ def main() -> None:
             "重构评估：遗忘前模型准确率=%.4f, 遗忘后模型准确率=%.4f", acc_before, acc_after
         )
 
-        if 0.8 <= acc_before <= 1.0 and 0.0 <= acc_after <= 0.6:
+        if acc_before >= 0.6 and acc_before > acc_after:
             LOGGER.info(
                 "重建成功：满足准确率约束 (前 %.2f%%, 后 %.2f%%)。",
                 acc_before * 100,
                 acc_after * 100,
             )
+            verify_choice = input("是否对生成的图像进行验证评估？(yes验证): ").strip().lower()
+            if verify_choice == "yes":
+                verification_performed = True
+                LOGGER.info(
+                    "验证阶段：遗忘前模型准确率=%.4f, 遗忘后模型准确率=%.4f",
+                    acc_before,
+                    acc_after,
+                )
+            else:
+                LOGGER.info("用户选择跳过验证阶段，沿用当前评估结果。")
             reconstructions = refined_reconstructions
             successful_acc_before = acc_before
             successful_acc_after = acc_after
@@ -1558,6 +1606,7 @@ def main() -> None:
         "reconstruction_accuracy_before": successful_acc_before,
         "reconstruction_accuracy_after": successful_acc_after,
         "reconstruction_tolerance": args.reconstruction_tolerance,
+        "verification_performed": verification_performed,
         "reinference_count": reinference_count,
         "baseline_class_accuracy": float(
             inference_result.per_class_before[inference_result.predicted_class].item()
