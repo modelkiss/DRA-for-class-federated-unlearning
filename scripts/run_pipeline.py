@@ -11,6 +11,7 @@ from typing import Dict, Sequence
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch.utils.data import Subset
 
 from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
@@ -129,6 +130,49 @@ def _evaluate_reconstruction_accuracy(
         predictions = logits.argmax(dim=1)
         matches = predictions == target_class
         return float(matches.float().mean().item())
+
+
+def _export_reconstruction_attempt(
+    images: torch.Tensor,
+    output_root: Path,
+    dataset: str,
+    attempt_index: int,
+) -> Path | None:
+    """Save reconstructed samples as PNG files under ``reconstruction-{attempt_index}``."""
+
+    if images.numel() == 0:
+        return None
+
+    attempt_dir = output_root / f"reconstruction-{attempt_index}"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        denorm = denormalize(images, get_normalization_stats(dataset))
+    except KeyError:
+        denorm = images
+
+    denorm = denorm.clamp(0.0, 1.0)
+    saved = 0
+    for idx, sample in enumerate(denorm):
+        tensor = sample.detach().cpu()
+        if tensor.dim() != 3:
+            continue
+        if tensor.size(0) == 1:
+            tensor = tensor.repeat(3, 1, 1)
+        array = (
+            tensor.mul(255.0)
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        image = Image.fromarray(array)
+        path = attempt_dir / f"sample-{idx:03d}.png"
+        image.save(path)
+        saved += 1
+
+    LOGGER.info("重建第 %d 次尝试的图像已导出至 %s (共 %d 张)", attempt_index, attempt_dir, saved)
+    return attempt_dir
 
 
 def _build_guidance_mask(inference: LabelInferenceResult) -> torch.Tensor:
@@ -1169,6 +1213,7 @@ def main() -> None:
     class_label: str | None = None
     user_confirmed_reconstruction = False
     selected_init_indices: list[int] | None = None
+    reconstruction_attempt_dirs: list[str] = []
 
     while True:
         transform = _build_penalty_transform(penalties)
@@ -1366,6 +1411,15 @@ def main() -> None:
             step_size=args.reconstruction_guidance_weight,
         )
 
+        attempt_dir = _export_reconstruction_attempt(
+            refined_reconstructions,
+            args.output,
+            args.dataset,
+            reinference_count + 1,
+        )
+        if attempt_dir is not None:
+            reconstruction_attempt_dirs.append(str(attempt_dir))
+
         acc_before = _evaluate_reconstruction_accuracy(
             pre_forgetting_model,
             refined_reconstructions,
@@ -1522,6 +1576,7 @@ def main() -> None:
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
         },
+        "reconstruction_attempt_dirs": reconstruction_attempt_dirs,
         "per_class_accuracy": per_class_records,
     }
 
