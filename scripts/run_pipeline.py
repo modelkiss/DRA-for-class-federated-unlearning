@@ -1159,6 +1159,7 @@ def main() -> None:
             LOGGER.info("用户选择复用已保存的模型权重，跳过联邦训练与遗忘阶段。")
 
     forgetting_result: ForgettingResult | None = None
+    proceed_inference_choice = "yes"
 
     if reuse_saved_models:
         pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
@@ -1172,6 +1173,7 @@ def main() -> None:
             baseline_accuracy,
             post_accuracy,
         )
+        LOGGER.info("复用模型后，将继续执行标签推理阶段以输出相关信息。")
     else:
         LOGGER.info("Starting federated pre-training for %d rounds", args.rounds)
         server.train(args.rounds)
@@ -1243,10 +1245,11 @@ def main() -> None:
             args.output,
         )
         LOGGER.info("Accuracy after forgetting: %.4f", post_accuracy)
-        proceed_inference = input("请输入 yes 以继续标签推理: ").strip().lower()
-        if proceed_inference != "yes":
-            LOGGER.info("用户拒绝继续标签推理，流程结束。")
-            return
+        proceed_inference_choice = input("请输入 yes 以继续标签推理: ").strip().lower()
+
+    if proceed_inference_choice != "yes":
+        LOGGER.info("用户拒绝继续标签推理，流程结束。")
+        return
 
     diffusion_config = DiffusionConfig(
         model_id=args.diffusion_model_id,
