@@ -1163,9 +1163,11 @@ def main() -> None:
 
     if reuse_saved_models:
         pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
-        pre_forgetting_model.load_state_dict(torch.load(model_before_path, map_location=device, weights_only=True))
+        pre_state_dict = torch.load(model_before_path, map_location=device)
+        pre_forgetting_model.load_state_dict(pre_state_dict)
         post_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
-        post_forgetting_model.load_state_dict(torch.load(model_after_path, map_location=device))
+        post_state_dict = torch.load(model_after_path, map_location=device)
+        post_forgetting_model.load_state_dict(post_state_dict)
         baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
         post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
         LOGGER.info(
@@ -1357,17 +1359,21 @@ def main() -> None:
 
     while True:
         transform = _build_penalty_transform(penalties)
-        inference = infer_forgotten_label(
-            before=pre_forgetting_model,
-            after=post_forgetting_model,
-            dataloader=federated_dataset.test_loader,
-            num_classes=federated_dataset.num_classes,
-            device=device,
-            ground_truth=args.target_class,
-            heatmap_samples=args.inference_heatmap_samples,
-            heatmap_border_ratio=args.inference_heatmap_border_ratio,
-            transform=transform,
-        )
+        try:
+            inference = infer_forgotten_label(
+                before=pre_forgetting_model,
+                after=post_forgetting_model,
+                dataloader=federated_dataset.test_loader,
+                num_classes=federated_dataset.num_classes,
+                device=device,
+                ground_truth=args.target_class,
+                heatmap_samples=args.inference_heatmap_samples,
+                heatmap_border_ratio=args.inference_heatmap_border_ratio,
+                transform=transform,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            LOGGER.error("标签推理过程中出现异常：%s，程序终止。", exc)
+            raise SystemExit("Label inference failed; aborting reconstruction pipeline") from exc
 
         LOGGER.info("标签推理阶段：输出各类别遗忘前后准确率对比。")
         for cls_index in range(inference.per_class_before.numel()):
