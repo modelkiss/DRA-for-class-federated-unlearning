@@ -65,7 +65,10 @@ class DiffusionReconstructor:
 
         self.logger = logging.getLogger(__name__)
         self.config = config
-        self.pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(config.model_id)
+        self.pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            use_auth_token=True
+        )
         target_dtype = config.dtype
         if config.device.type == "cpu":
             target_dtype = torch.float32

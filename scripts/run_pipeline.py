@@ -885,7 +885,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--diffusion-model-id",
-        default="runwayml/stable-diffusion-v1-5",
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
         help="Pretrained diffusion pipeline identifier (diffusers).",
     )
     parser.add_argument(
@@ -1162,7 +1162,7 @@ def main() -> None:
 
     if reuse_saved_models:
         pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
-        pre_forgetting_model.load_state_dict(torch.load(model_before_path, map_location=device))
+        pre_forgetting_model.load_state_dict(torch.load(model_before_path, map_location=device, weights_only=True))
         post_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
         post_forgetting_model.load_state_dict(torch.load(model_after_path, map_location=device))
         baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
