@@ -676,12 +676,22 @@ def _fine_tune_sensitive_features(
             noisy_latents = control_pipeline.scheduler.add_noise(latents, noise, timesteps)
 
             encoder_hidden_states = control_pipeline.text_encoder(input_ids, attention_mask=attention_mask)[0]
+
+            controlnet_output = control_pipeline.controlnet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                controlnet_cond=control,
+                conditioning_scale=config.condition_scale,
+                return_dict=True,
+            )
+
             model_pred = control_pipeline.unet(
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states,
-                controlnet_cond=control,
-                conditioning_scale=config.condition_scale,
+                down_block_additional_residuals=controlnet_output.down_block_res_samples,
+                mid_block_additional_residual=controlnet_output.mid_block_res_sample,
             ).sample
 
             if control_pipeline.scheduler.config.prediction_type == "epsilon":
