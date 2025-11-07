@@ -342,11 +342,16 @@ class _GeneratedDataset(Dataset):
 
 def _prepare_lora_layers(unet: nn.Module, rank: int, alpha: float) -> nn.Module:
     try:
-        from diffusers.models.attention_processor import AttnProcsLayers, LoRAAttnProcessor
+        from diffusers.models.attention_processor import LoRAAttnProcessor
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Diffusers with LoRA support is required. Install diffusers>=0.20.0"
         ) from exc
+
+    try:  # diffusers>=0.25.0 provides AttnProcsLayers, but older versions do not
+        from diffusers.models.attention_processor import AttnProcsLayers  # type: ignore
+    except ImportError:  # pragma: no cover - gracefully handle older versions
+        AttnProcsLayers = None
 
     lora_attn_procs = {}
     for name, module in unet.named_modules():
@@ -363,7 +368,18 @@ def _prepare_lora_layers(unet: nn.Module, rank: int, alpha: float) -> nn.Module:
     if not lora_attn_procs:
         raise RuntimeError("Failed to locate attention processors for LoRA training")
     unet.set_attn_processor(lora_attn_procs)
-    trainable = AttnProcsLayers(unet.attn_processors)
+    if AttnProcsLayers is not None:
+        trainable: nn.Module = AttnProcsLayers(unet.attn_processors)
+    else:
+        unique_processors: list[nn.Module] = []
+        seen_ids: set[int] = set()
+        for processor in unet.attn_processors.values():
+            if id(processor) in seen_ids:
+                continue
+            unique_processors.append(processor)
+            seen_ids.add(id(processor))
+        trainable = nn.ModuleList(unique_processors)
+    trainable.requires_grad_(True)
     return trainable
 
 
