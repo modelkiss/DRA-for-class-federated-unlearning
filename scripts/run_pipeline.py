@@ -12,6 +12,13 @@ from typing import Dict, Sequence
 import torch
 from torch.utils.data import Subset
 
+from src.attacks.data_reconstruction import (
+    AdaptiveGenerationConfig,
+    BaseDiffusionTrainingConfig,
+    DataReconstructionConfig,
+    SensitiveFeatureFinetuneConfig,
+    run_data_reconstruction,
+)
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.attacks.sensitive_feature_inference import (
     SensitiveFeatureConfig,
@@ -746,6 +753,112 @@ def parse_args() -> argparse.Namespace:
         default=150,
         help="ControlNet 辅助的 Canny 高阈值。",
     )
+    parser.add_argument(
+        "--disable-reconstruction",
+        action="store_true",
+        help="跳过扩散模型的重建与自适应生成阶段。",
+    )
+    parser.add_argument(
+        "--recon-method",
+        choices=["lora", "textual_inversion"],
+        default="lora",
+        help="基础扩散训练所采用的适配方式。",
+    )
+    parser.add_argument(
+        "--recon-train-steps",
+        type=int,
+        default=1500,
+        help="基础扩散训练的最大步数。",
+    )
+    parser.add_argument(
+        "--recon-batch-size",
+        type=int,
+        default=2,
+        help="基础扩散训练时的 batch size。",
+    )
+    parser.add_argument(
+        "--recon-learning-rate",
+        type=float,
+        default=1e-4,
+        help="基础扩散训练的学习率。",
+    )
+    parser.add_argument(
+        "--recon-lora-rank",
+        type=int,
+        default=8,
+        help="LoRA 适配时的 rank。",
+    )
+    parser.add_argument(
+        "--recon-resolution",
+        type=int,
+        default=512,
+        help="扩散模型训练与生成的分辨率。",
+    )
+    parser.add_argument(
+        "--recon-guidance-scale",
+        type=float,
+        default=7.5,
+        help="自适应生成初始 guidance scale。",
+    )
+    parser.add_argument(
+        "--recon-inference-steps",
+        type=int,
+        default=30,
+        help="自适应生成初始推理步数。",
+    )
+    parser.add_argument(
+        "--recon-target-min",
+        type=float,
+        default=0.3,
+        help="遗忘后模型在重建样本上的准确率下界。",
+    )
+    parser.add_argument(
+        "--recon-target-max",
+        type=float,
+        default=0.7,
+        help="遗忘后模型在重建样本上的准确率上界。",
+    )
+    parser.add_argument(
+        "--recon-accuracy-margin",
+        type=float,
+        default=0.05,
+        help="遗忘前模型与遗忘后模型准确率之间的最小间隔。",
+    )
+    parser.add_argument(
+        "--recon-max-batches",
+        type=int,
+        default=10,
+        help="自适应生成最大迭代批次数。",
+    )
+    parser.add_argument(
+        "--recon-images-per-batch",
+        type=int,
+        default=1024,
+        help="每轮生成的样本数量。",
+    )
+    parser.add_argument(
+        "--recon-save-rejected",
+        action="store_true",
+        help="是否保存未满足条件的重建批次。",
+    )
+    parser.add_argument(
+        "--recon-controlnet",
+        type=str,
+        default="lllyasviel/sd-controlnet-canny",
+        help="敏感特征微调阶段使用的 ControlNet 模型。",
+    )
+    parser.add_argument(
+        "--recon-sensitive-steps",
+        type=int,
+        default=800,
+        help="敏感特征微调阶段的最大训练步数。",
+    )
+    parser.add_argument(
+        "--recon-sensitive-lr",
+        type=float,
+        default=5e-5,
+        help="敏感特征微调阶段的学习率。",
+    )
     return parser.parse_args()
 
 
@@ -1139,6 +1252,10 @@ def main() -> None:
         match_status,
     )
 
+    sfi_summary: dict[str, object] | None = None
+
+    stats = get_normalization_stats(args.dataset)
+
     if args.disable_sfi:
         LOGGER.info("已跳过敏感特征推理阶段 (--disable-sfi)")
     else:
@@ -1154,7 +1271,6 @@ def main() -> None:
             canny_low=max(0, args.sfi_canny_low),
             canny_high=max(args.sfi_canny_low + 1, args.sfi_canny_high),
         )
-        stats = get_normalization_stats(args.dataset)
         sfi_output = Path("outputs") / "sfi"
         LOGGER.info(
             "启动敏感特征推理：候选类别≤%d，图块数=%d，掩码分位数=%.2f",
@@ -1172,6 +1288,65 @@ def main() -> None:
         with (args.output / "sfi_summary.json").open("w", encoding="utf-8") as handle:
             json.dump(sfi_summary, handle, indent=2)
         LOGGER.info("敏感特征推理完成，产物位于 %s", sfi_output)
+
+    if args.disable_reconstruction:
+        LOGGER.info("已跳过数据重建阶段 (--disable-reconstruction)")
+    else:
+        recon_config = DataReconstructionConfig(
+            base=BaseDiffusionTrainingConfig(
+                model_id=sfi_summary.get("stable_diffusion_model", "runwayml/stable-diffusion-v1-5")
+                if sfi_summary
+                else "runwayml/stable-diffusion-v1-5",
+                method=args.recon_method,
+                max_train_steps=max(1, args.recon_train_steps),
+                batch_size=max(1, args.recon_batch_size),
+                learning_rate=args.recon_learning_rate,
+                lora_rank=max(1, args.recon_lora_rank),
+                resolution=max(64, args.recon_resolution),
+            ),
+            sensitive=SensitiveFeatureFinetuneConfig(
+                enabled=not args.disable_sfi,
+                controlnet_model_id=args.recon_controlnet,
+                learning_rate=args.recon_sensitive_lr,
+                max_train_steps=max(1, args.recon_sensitive_steps),
+            ),
+            adaptive=AdaptiveGenerationConfig(
+                images_per_batch=max(1, args.recon_images_per_batch),
+                max_batches=max(1, args.recon_max_batches),
+                guidance_scale=args.recon_guidance_scale,
+                num_inference_steps=max(10, args.recon_inference_steps),
+                target_accuracy_min=max(0.0, min(1.0, args.recon_target_min)),
+                target_accuracy_max=max(0.0, min(1.0, args.recon_target_max)),
+                accuracy_margin=max(0.0, args.recon_accuracy_margin),
+                save_rejected=args.recon_save_rejected,
+            ),
+        )
+
+        LOGGER.info(
+            "启动数据重建流程：基础训练步数=%d，敏感特征步数=%d，自适应批次上限=%d",
+            recon_config.base.max_train_steps,
+            recon_config.sensitive.max_train_steps,
+            recon_config.adaptive.max_batches,
+        )
+
+        reconstruction_dir = args.output / "reconstruction"
+        reconstruction_result = run_data_reconstruction(
+            inference_result,
+            dataloader=federated_dataset.test_loader,
+            normalization_stats=stats,
+            model_before=pre_forgetting_model.to(device).eval(),
+            model_after=post_forgetting_model.to(device).eval(),
+            output_root=reconstruction_dir,
+            device=device,
+            config=recon_config,
+            sfi_summary=sfi_summary,
+            dataset_name=args.dataset,
+        )
+        LOGGER.info(
+            "数据重建完成，已接受批次数=%d，结果保存在 %s",
+            len(reconstruction_result.accepted_batches),
+            reconstruction_result.output_dir,
+        )
 
 
 def perform_forgetting(
