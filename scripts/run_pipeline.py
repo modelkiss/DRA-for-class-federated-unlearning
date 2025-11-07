@@ -695,11 +695,6 @@ def parse_args() -> argparse.Namespace:
         help="边缘纹理分析所采用的边界宽度占比 (0-0.5)。",
     )
     parser.add_argument(
-        "--disable-sfi",
-        action="store_true",
-        help="禁用敏感特征推理阶段，仅执行标签推理与模型评估。",
-    )
-    parser.add_argument(
         "--sfi-max-classes",
         type=int,
         default=3,
@@ -752,11 +747,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=150,
         help="ControlNet 辅助的 Canny 高阈值。",
-    )
-    parser.add_argument(
-        "--disable-reconstruction",
-        action="store_true",
-        help="跳过扩散模型的重建与自适应生成阶段。",
     )
     parser.add_argument(
         "--recon-method",
@@ -1252,101 +1242,102 @@ def main() -> None:
         match_status,
     )
 
+    user_response = input("是否继续执行敏感特征推理和数据重建？(y/n)：").strip().lower()
+    if user_response not in {"y", "yes", "是", "true"}:
+        LOGGER.info("用户选择终止流程，敏感特征推理和数据重建未执行。")
+        return
+
+    LOGGER.info("继续执行敏感特征推理和数据重建流程。")
+
     sfi_summary: dict[str, object] | None = None
 
     stats = get_normalization_stats(args.dataset)
 
-    if args.disable_sfi:
-        LOGGER.info("已跳过敏感特征推理阶段 (--disable-sfi)")
-    else:
-        sfi_config = SensitiveFeatureConfig(
-            max_classes=max(1, args.sfi_max_classes),
-            mask_quantile=args.sfi_mask_quantile,
-            mask_min_threshold=args.sfi_mask_min_threshold,
-            edge_border_ratio=args.inference_heatmap_border_ratio,
-            patch_size=max(4, args.sfi_patch_size),
-            num_patches=max(1, args.sfi_num_patches),
-            dct_components=max(1, args.sfi_dct_components),
-            num_prototypes=max(1, args.sfi_num_prototypes),
-            canny_low=max(0, args.sfi_canny_low),
-            canny_high=max(args.sfi_canny_low + 1, args.sfi_canny_high),
-        )
-        sfi_output = Path("outputs") / "sfi"
-        LOGGER.info(
-            "启动敏感特征推理：候选类别≤%d，图块数=%d，掩码分位数=%.2f",
-            sfi_config.max_classes,
-            sfi_config.num_patches,
-            sfi_config.mask_quantile,
-        )
-        sfi_summary = run_sensitive_feature_inference(
-            inference_result,
-            output_root=sfi_output,
-            dataset=args.dataset,
-            normalization_stats=stats,
-            config=sfi_config,
-        )
-        with (args.output / "sfi_summary.json").open("w", encoding="utf-8") as handle:
-            json.dump(sfi_summary, handle, indent=2)
-        LOGGER.info("敏感特征推理完成，产物位于 %s", sfi_output)
+    sfi_config = SensitiveFeatureConfig(
+        max_classes=max(1, args.sfi_max_classes),
+        mask_quantile=args.sfi_mask_quantile,
+        mask_min_threshold=args.sfi_mask_min_threshold,
+        edge_border_ratio=args.inference_heatmap_border_ratio,
+        patch_size=max(4, args.sfi_patch_size),
+        num_patches=max(1, args.sfi_num_patches),
+        dct_components=max(1, args.sfi_dct_components),
+        num_prototypes=max(1, args.sfi_num_prototypes),
+        canny_low=max(0, args.sfi_canny_low),
+        canny_high=max(args.sfi_canny_low + 1, args.sfi_canny_high),
+    )
+    sfi_output = Path("outputs") / "sfi"
+    LOGGER.info(
+        "启动敏感特征推理：候选类别≤%d，图块数=%d，掩码分位数=%.2f",
+        sfi_config.max_classes,
+        sfi_config.num_patches,
+        sfi_config.mask_quantile,
+    )
+    sfi_summary = run_sensitive_feature_inference(
+        inference_result,
+        output_root=sfi_output,
+        dataset=args.dataset,
+        normalization_stats=stats,
+        config=sfi_config,
+    )
+    with (args.output / "sfi_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(sfi_summary, handle, indent=2)
+    LOGGER.info("敏感特征推理完成，产物位于 %s", sfi_output)
 
-    if args.disable_reconstruction:
-        LOGGER.info("已跳过数据重建阶段 (--disable-reconstruction)")
-    else:
-        recon_config = DataReconstructionConfig(
-            base=BaseDiffusionTrainingConfig(
-                model_id=sfi_summary.get("stable_diffusion_model", "runwayml/stable-diffusion-v1-5")
-                if sfi_summary
-                else "runwayml/stable-diffusion-v1-5",
-                method=args.recon_method,
-                max_train_steps=max(1, args.recon_train_steps),
-                batch_size=max(1, args.recon_batch_size),
-                learning_rate=args.recon_learning_rate,
-                lora_rank=max(1, args.recon_lora_rank),
-                resolution=max(64, args.recon_resolution),
-            ),
-            sensitive=SensitiveFeatureFinetuneConfig(
-                enabled=not args.disable_sfi,
-                controlnet_model_id=args.recon_controlnet,
-                learning_rate=args.recon_sensitive_lr,
-                max_train_steps=max(1, args.recon_sensitive_steps),
-            ),
-            adaptive=AdaptiveGenerationConfig(
-                images_per_batch=max(1, args.recon_images_per_batch),
-                max_batches=max(1, args.recon_max_batches),
-                guidance_scale=args.recon_guidance_scale,
-                num_inference_steps=max(10, args.recon_inference_steps),
-                target_accuracy_min=max(0.0, min(1.0, args.recon_target_min)),
-                target_accuracy_max=max(0.0, min(1.0, args.recon_target_max)),
-                accuracy_margin=max(0.0, args.recon_accuracy_margin),
-                save_rejected=args.recon_save_rejected,
-            ),
-        )
+    recon_config = DataReconstructionConfig(
+        base=BaseDiffusionTrainingConfig(
+            model_id=sfi_summary.get("stable_diffusion_model", "runwayml/stable-diffusion-v1-5")
+            if sfi_summary
+            else "runwayml/stable-diffusion-v1-5",
+            method=args.recon_method,
+            max_train_steps=max(1, args.recon_train_steps),
+            batch_size=max(1, args.recon_batch_size),
+            learning_rate=args.recon_learning_rate,
+            lora_rank=max(1, args.recon_lora_rank),
+            resolution=max(64, args.recon_resolution),
+        ),
+        sensitive=SensitiveFeatureFinetuneConfig(
+            enabled=True,
+            controlnet_model_id=args.recon_controlnet,
+            learning_rate=args.recon_sensitive_lr,
+            max_train_steps=max(1, args.recon_sensitive_steps),
+        ),
+        adaptive=AdaptiveGenerationConfig(
+            images_per_batch=max(1, args.recon_images_per_batch),
+            max_batches=max(1, args.recon_max_batches),
+            guidance_scale=args.recon_guidance_scale,
+            num_inference_steps=max(10, args.recon_inference_steps),
+            target_accuracy_min=max(0.0, min(1.0, args.recon_target_min)),
+            target_accuracy_max=max(0.0, min(1.0, args.recon_target_max)),
+            accuracy_margin=max(0.0, args.recon_accuracy_margin),
+            save_rejected=args.recon_save_rejected,
+        ),
+    )
 
-        LOGGER.info(
-            "启动数据重建流程：基础训练步数=%d，敏感特征步数=%d，自适应批次上限=%d",
-            recon_config.base.max_train_steps,
-            recon_config.sensitive.max_train_steps,
-            recon_config.adaptive.max_batches,
-        )
+    LOGGER.info(
+        "启动数据重建流程：基础训练步数=%d，敏感特征步数=%d，自适应批次上限=%d",
+        recon_config.base.max_train_steps,
+        recon_config.sensitive.max_train_steps,
+        recon_config.adaptive.max_batches,
+    )
 
-        reconstruction_dir = args.output / "reconstruction"
-        reconstruction_result = run_data_reconstruction(
-            inference_result,
-            dataloader=federated_dataset.test_loader,
-            normalization_stats=stats,
-            model_before=pre_forgetting_model.to(device).eval(),
-            model_after=post_forgetting_model.to(device).eval(),
-            output_root=reconstruction_dir,
-            device=device,
-            config=recon_config,
-            sfi_summary=sfi_summary,
-            dataset_name=args.dataset,
-        )
-        LOGGER.info(
-            "数据重建完成，已接受批次数=%d，结果保存在 %s",
-            len(reconstruction_result.accepted_batches),
-            reconstruction_result.output_dir,
-        )
+    reconstruction_dir = args.output / "reconstruction"
+    reconstruction_result = run_data_reconstruction(
+        inference_result,
+        dataloader=federated_dataset.test_loader,
+        normalization_stats=stats,
+        model_before=pre_forgetting_model.to(device).eval(),
+        model_after=post_forgetting_model.to(device).eval(),
+        output_root=reconstruction_dir,
+        device=device,
+        config=recon_config,
+        sfi_summary=sfi_summary,
+        dataset_name=args.dataset,
+    )
+    LOGGER.info(
+        "数据重建完成，已接受批次数=%d，结果保存在 %s",
+        len(reconstruction_result.accepted_batches),
+        reconstruction_result.output_dir,
+    )
 
 
 def perform_forgetting(
