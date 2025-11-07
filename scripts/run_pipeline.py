@@ -212,8 +212,15 @@ def _export_sample_heatmaps(
     cmap: str,
     device: torch.device,
     plt_module,
+    target_class: int | None = None,
+    max_samples: int | None = None,
 ) -> Path:
-    """Generate per-sample visualisations comparing saliency maps before/after forgetting."""
+    """Generate per-sample visualisations comparing saliency maps before/after forgetting.
+
+    When ``target_class`` is provided, only samples whose ground-truth label matches the
+    forgotten class are exported. ``max_samples`` can be used to cap the number of
+    rendered figures (e.g. export only 1000 images for CIFAR-10).
+    """
 
     stats = get_normalization_stats(dataset)
     sample_dir = output_dir / f"sample_heatmaps_{dataset}"
@@ -223,9 +230,30 @@ def _export_sample_heatmaps(
     model_after = model_after.to(device).eval()
 
     total = 0
-    for batch_index, (inputs, targets) in enumerate(dataloader):
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+    for batch_index, (batch_inputs, batch_targets) in enumerate(dataloader):
+        if target_class is not None:
+            mask = batch_targets == target_class
+            if not torch.any(mask):
+                continue
+            batch_inputs = batch_inputs[mask]
+            batch_targets = batch_targets[mask]
+
+        if max_samples is not None and max_samples <= total:
+            break
+
+        if max_samples is not None:
+            remaining = max_samples - total
+            if remaining <= 0:
+                break
+            if batch_inputs.size(0) > remaining:
+                batch_inputs = batch_inputs[:remaining]
+                batch_targets = batch_targets[:remaining]
+
+        if batch_inputs.size(0) == 0:
+            continue
+
+        inputs = batch_inputs.to(device)
+        targets = batch_targets.to(device)
         with torch.enable_grad():
             before_maps, before_preds = _compute_saliency_maps(model_before, inputs)
             after_maps, after_preds = _compute_saliency_maps(model_after, inputs)
@@ -274,7 +302,21 @@ def _export_sample_heatmaps(
             total,
         )
 
-    LOGGER.info("已为测试集生成 %d 张热力图对比图，保存在 %s", total, sample_dir)
+    if target_class is not None:
+        if total == 0:
+            LOGGER.warning(
+                "测试集中未找到目标遗忘类别 %d 的样本，未生成任何热力图。",
+                int(target_class),
+            )
+        else:
+            LOGGER.info(
+                "已为目标遗忘类别 %d 生成 %d 张热力图对比图，保存在 %s",
+                int(target_class),
+                total,
+                sample_dir,
+            )
+    else:
+        LOGGER.info("已为测试集生成 %d 张热力图对比图，保存在 %s", total, sample_dir)
     return sample_dir
 
 
@@ -1446,6 +1488,14 @@ def export_heatmaps(
         results["gradient"] = gradient_path
 
     if dataloader is not None and model_before is not None and model_after is not None and device is not None:
+        target_class = inference.ground_truth
+        if target_class is None:
+            target_class = inference.predicted_class
+        sample_limit: int | None = None
+        if target_class is not None:
+            sample_tensor = inference.sample_bank.get(int(target_class)) if inference.sample_bank else None
+            if sample_tensor is not None and sample_tensor.numel() > 0:
+                sample_limit = sample_tensor.size(0)
         results["samples"] = _export_sample_heatmaps(
             dataloader=dataloader,
             model_before=model_before,
@@ -1455,6 +1505,8 @@ def export_heatmaps(
             cmap=cmap,
             device=device,
             plt_module=plt,
+            target_class=None if target_class is None else int(target_class),
+            max_samples=sample_limit,
         )
 
     return results
