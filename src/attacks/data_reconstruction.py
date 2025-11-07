@@ -108,8 +108,8 @@ class AdaptiveGenerationConfig:
     num_inference_steps: int = 30
     guidance_scale: float = 7.5
     controlnet_scale: float = 1.0
-    target_accuracy_min: float = 0.3
-    target_accuracy_max: float = 0.7
+    target_accuracy_min: float = 0
+    target_accuracy_max: float = 0.6
     accuracy_margin: float = 0.05
     adjustment_step: float = 0.2
     step_increment: int = 5
@@ -342,28 +342,76 @@ class _GeneratedDataset(Dataset):
 
 def _prepare_lora_layers(unet: nn.Module, rank: int, alpha: float) -> nn.Module:
     try:
-        from diffusers.models.attention_processor import AttnProcsLayers, LoRAAttnProcessor
+        from diffusers.models.attention_processor import LoRAAttnProcessor
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "Diffusers with LoRA support is required. Install diffusers>=0.20.0"
         ) from exc
 
-    lora_attn_procs = {}
-    for name, module in unet.named_modules():
-        if module.__class__.__name__ != "CrossAttention":
-            continue
-        hidden_size = module.to_q.in_features
-        cross_attention_dim = module.context_dim if hasattr(module, "context_dim") else module.to_k.in_features
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=rank,
-            network_alpha=alpha,
-        )
+    try:  # diffusers>=0.25.0 provides AttnProcsLayers, but older versions do not
+        from diffusers.models.attention_processor import AttnProcsLayers  # type: ignore
+    except ImportError:  # pragma: no cover - gracefully handle older versions
+        AttnProcsLayers = None
+
+    lora_attn_procs: dict[str, nn.Module] = {}
+
+    if hasattr(unet, "attn_processors") and unet.attn_processors:
+        # diffusers>=0.15 exposes attention processors directly through the UNet
+        # configuration, which allows us to construct LoRA adapters without relying on
+        # brittle module name inspection. The logic is adapted from the official
+        # LoRA training example in the diffusers repository.
+        for name in unet.attn_processors.keys():
+            if name.endswith("attn1.processor"):
+                cross_attention_dim = None
+            else:
+                cross_attention_dim = getattr(unet.config, "cross_attention_dim", None)
+
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name.split(".")[1])
+                hidden_size = list(unet.config.block_out_channels[::-1])[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name.split(".")[1])
+                hidden_size = unet.config.block_out_channels[block_id]
+            else:  # pragma: no cover - defensive branch for future architectures
+                continue
+
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=rank,
+                network_alpha=alpha,
+            )
+    else:
+        for name, module in unet.named_modules():
+            if module.__class__.__name__ != "CrossAttention":
+                continue
+            hidden_size = module.to_q.in_features
+            cross_attention_dim = (
+                module.context_dim if hasattr(module, "context_dim") else module.to_k.in_features
+            )
+            lora_attn_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=rank,
+                network_alpha=alpha,
+            )
     if not lora_attn_procs:
         raise RuntimeError("Failed to locate attention processors for LoRA training")
     unet.set_attn_processor(lora_attn_procs)
-    trainable = AttnProcsLayers(unet.attn_processors)
+    if AttnProcsLayers is not None:
+        trainable: nn.Module = AttnProcsLayers(unet.attn_processors)
+    else:
+        unique_processors: list[nn.Module] = []
+        seen_ids: set[int] = set()
+        for processor in unet.attn_processors.values():
+            if id(processor) in seen_ids:
+                continue
+            unique_processors.append(processor)
+            seen_ids.add(id(processor))
+        trainable = nn.ModuleList(unique_processors)
+    trainable.requires_grad_(True)
     return trainable
 
 
