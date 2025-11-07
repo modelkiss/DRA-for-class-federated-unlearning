@@ -20,18 +20,6 @@ from ..utils.metrics import (
 
 
 @dataclass
-class SensitiveFeature:
-    """A sensitive feature inferred from forensic signals."""
-
-    name: str
-    score: float
-    source: str
-
-    def to_dict(self) -> dict[str, float | str]:
-        return {"name": self.name, "score": float(self.score), "source": self.source}
-
-
-@dataclass
 class LabelInferenceResult:
     predicted_class: int
     score_vector: torch.Tensor
@@ -60,7 +48,6 @@ class LabelInferenceResult:
     weight_delta: torch.Tensor | None = None
     bias_delta: torch.Tensor | None = None
     candidate_details: dict[int, dict[str, float]] | None = None
-    sensitive_features: Sequence[SensitiveFeature] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -91,9 +78,6 @@ class LabelInferenceResult:
             if self.bias_delta is None
             else self.bias_delta.tolist(),
             "candidate_details": self.candidate_details,
-            "sensitive_features": None
-            if self.sensitive_features is None
-            else [feature.to_dict() for feature in self.sensitive_features],
             "accuracy_before": self.accuracy_before.tolist(),
             "accuracy_after": self.accuracy_after.tolist(),
             "accuracy_drop": self.accuracy_drop.tolist(),
@@ -616,7 +600,6 @@ def infer_forgotten_label(
             cls: {key: float(value) for key, value in details.items()}
             for cls, details in candidate_details.items()
         },
-        sensitive_features=None,
     )
 
-__all__ = ["LabelInferenceResult", "SensitiveFeature", "infer_forgotten_label"]
+__all__ = ["LabelInferenceResult", "infer_forgotten_label"]
