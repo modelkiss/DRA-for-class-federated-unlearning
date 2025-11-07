@@ -13,6 +13,10 @@ import torch
 from torch.utils.data import Subset
 
 from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
+from src.attacks.sensitive_feature_inference import (
+    SensitiveFeatureConfig,
+    run_sensitive_feature_inference,
+)
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.aggregation import AggregationConfig
@@ -683,6 +687,65 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="边缘纹理分析所采用的边界宽度占比 (0-0.5)。",
     )
+    parser.add_argument(
+        "--disable-sfi",
+        action="store_true",
+        help="禁用敏感特征推理阶段，仅执行标签推理与模型评估。",
+    )
+    parser.add_argument(
+        "--sfi-max-classes",
+        type=int,
+        default=3,
+        help="敏感特征推理分析的候选类别数量上限。",
+    )
+    parser.add_argument(
+        "--sfi-mask-quantile",
+        type=float,
+        default=0.8,
+        help="敏感区域掩码的分位数阈值 (0-1)。",
+    )
+    parser.add_argument(
+        "--sfi-mask-min-threshold",
+        type=float,
+        default=0.25,
+        help="敏感区域掩码的最小响应阈值 (0-1)。",
+    )
+    parser.add_argument(
+        "--sfi-patch-size",
+        type=int,
+        default=32,
+        help="敏感纹理采样的图块尺寸 (像素)。",
+    )
+    parser.add_argument(
+        "--sfi-num-patches",
+        type=int,
+        default=32,
+        help="每个候选类别提取的图块数量。",
+    )
+    parser.add_argument(
+        "--sfi-dct-components",
+        type=int,
+        default=64,
+        help="每个图块保留的 DCT 高频特征维度。",
+    )
+    parser.add_argument(
+        "--sfi-num-prototypes",
+        type=int,
+        default=8,
+        help="纹理聚类时生成的原型数量。",
+    )
+    parser.add_argument(
+        "--sfi-canny-low",
+        type=int,
+        default=50,
+        help="ControlNet 辅助的 Canny 低阈值。",
+    )
+    parser.add_argument(
+        "--sfi-canny-high",
+        type=int,
+        default=150,
+        help="ControlNet 辅助的 Canny 高阈值。",
+    )
     return parser.parse_args()
 
 
@@ -1075,6 +1138,40 @@ def main() -> None:
         inference_result.predicted_class,
         match_status,
     )
+
+    if args.disable_sfi:
+        LOGGER.info("已跳过敏感特征推理阶段 (--disable-sfi)")
+    else:
+        sfi_config = SensitiveFeatureConfig(
+            max_classes=max(1, args.sfi_max_classes),
+            mask_quantile=args.sfi_mask_quantile,
+            mask_min_threshold=args.sfi_mask_min_threshold,
+            edge_border_ratio=args.inference_heatmap_border_ratio,
+            patch_size=max(4, args.sfi_patch_size),
+            num_patches=max(1, args.sfi_num_patches),
+            dct_components=max(1, args.sfi_dct_components),
+            num_prototypes=max(1, args.sfi_num_prototypes),
+            canny_low=max(0, args.sfi_canny_low),
+            canny_high=max(args.sfi_canny_low + 1, args.sfi_canny_high),
+        )
+        stats = get_normalization_stats(args.dataset)
+        sfi_output = Path("outputs") / "sfi"
+        LOGGER.info(
+            "启动敏感特征推理：候选类别≤%d，图块数=%d，掩码分位数=%.2f",
+            sfi_config.max_classes,
+            sfi_config.num_patches,
+            sfi_config.mask_quantile,
+        )
+        sfi_summary = run_sensitive_feature_inference(
+            inference_result,
+            output_root=sfi_output,
+            dataset=args.dataset,
+            normalization_stats=stats,
+            config=sfi_config,
+        )
+        with (args.output / "sfi_summary.json").open("w", encoding="utf-8") as handle:
+            json.dump(sfi_summary, handle, indent=2)
+        LOGGER.info("敏感特征推理完成，产物位于 %s", sfi_output)
 
 
 def perform_forgetting(
