@@ -10,12 +10,9 @@ from pathlib import Path
 from typing import Dict, Sequence
 
 import torch
-import torch.nn.functional as F
-from PIL import Image
 from torch.utils.data import Subset
 
-from src.attacks.data_reconstruction import DiffusionConfig, DiffusionReconstructor
-from src.attacks.label_inference import LabelInferenceResult, SensitiveFeature, infer_forgotten_label
+from src.attacks.label_inference import LabelInferenceResult, infer_forgotten_label
 from src.data.datasets import FederatedDataConfig, FederatedDataset, create_federated_dataloaders
 from src.defenses.differential_privacy import DifferentialPrivacyConfig
 from src.federated.aggregation import AggregationConfig
@@ -95,184 +92,6 @@ def _compute_saliency_maps(model: torch.nn.Module, inputs: torch.Tensor) -> tupl
     saliency = grads.abs().amax(dim=1, keepdim=False)
     saliency = _normalize_heatmap(saliency)
     return saliency.detach(), preds.detach()
-
-
-def _normalize_to_dataset(images: torch.Tensor, dataset: str) -> torch.Tensor:
-    """Normalise reconstructed images according to dataset statistics."""
-
-    mean, std = get_normalization_stats(dataset)
-    device = images.device
-    dtype = images.dtype
-    mean_tensor = torch.tensor(mean, device=device, dtype=dtype).view(1, -1, 1, 1)
-    std_tensor = torch.tensor(std, device=device, dtype=dtype).view(1, -1, 1, 1)
-    return (images - mean_tensor) / std_tensor
-
-
-def _evaluate_reconstruction_accuracy(
-    model: torch.nn.Module,
-    reconstructions: torch.Tensor,
-    target_class: int,
-    dataset: str,
-    device: torch.device,
-) -> float:
-    """Classify reconstructions and compute accuracy for ``target_class``."""
-
-    if reconstructions.numel() == 0:
-        return 0.0
-
-    model = model.to(device)
-    model.eval()
-    with torch.no_grad():
-        images = reconstructions.to(device)
-        images = images.clamp(0.0, 1.0)
-        images = _normalize_to_dataset(images, dataset)
-        logits = model(images)
-        predictions = logits.argmax(dim=1)
-        matches = predictions == target_class
-        return float(matches.float().mean().item())
-
-
-def _export_reconstruction_attempt(
-    images: torch.Tensor,
-    output_root: Path,
-    dataset: str,
-    attempt_index: int,
-) -> Path | None:
-    """Save reconstructed samples as PNG files under ``reconstruction-{attempt_index}``."""
-
-    if images.numel() == 0:
-        return None
-
-    attempt_dir = output_root / f"reconstruction-{attempt_index}"
-    attempt_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        denorm = denormalize(images, get_normalization_stats(dataset))
-    except KeyError:
-        denorm = images
-
-    denorm = denorm.clamp(0.0, 1.0)
-    saved = 0
-    for idx, sample in enumerate(denorm):
-        tensor = sample.detach().cpu()
-        if tensor.dim() != 3:
-            continue
-        if tensor.size(0) == 1:
-            tensor = tensor.repeat(3, 1, 1)
-        array = (
-            tensor.mul(255.0)
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(1, 2, 0)
-            .numpy()
-        )
-        image = Image.fromarray(array)
-        path = attempt_dir / f"sample-{idx:03d}.png"
-        image.save(path)
-        saved += 1
-
-    LOGGER.info("重建第 %d 次尝试的图像已导出至 %s (共 %d 张)", attempt_index, attempt_dir, saved)
-    return attempt_dir
-
-
-def _build_guidance_mask(inference: LabelInferenceResult) -> torch.Tensor:
-    """根据热力图差异构建扩散模型的引导掩模。"""
-
-    cache = inference.heatmap_cache.get(inference.predicted_class)
-    if not cache:
-        raise ValueError("缺少预测类别的热力图缓存，无法生成引导掩模。")
-
-    def _mean_map(key: str) -> torch.Tensor:
-        tensor = cache.get(key)
-        if tensor is None or tensor.numel() == 0:
-            raise ValueError(f"热力图缓存缺失 {key} 信息")
-        return tensor.float().mean(dim=0)
-
-    gradcam_before = _mean_map("gradcam_before")
-    gradcam_after = _mean_map("gradcam_after")
-    saliency_before = _mean_map("saliency_before")
-    saliency_after = _mean_map("saliency_after")
-
-    cam_diff = torch.relu(gradcam_before - gradcam_after)
-    saliency_diff = torch.relu(saliency_before - saliency_after)
-    combined = cam_diff + saliency_diff
-    combined = combined.unsqueeze(0)
-    combined = _normalize_heatmap(combined)[0]
-    threshold = float(combined.mean().item())
-    binary_mask = (combined >= threshold).float()
-    soft_mask = combined * binary_mask
-    soft_mask = _normalize_heatmap(soft_mask.unsqueeze(0))[0]
-    return soft_mask.clamp(0.0, 1.0)
-
-
-def _refine_reconstructions(
-    images: torch.Tensor,
-    *,
-    model_before: torch.nn.Module,
-    model_after: torch.nn.Module,
-    target_class: int,
-    dataset: str,
-    mask: torch.Tensor,
-    device: torch.device,
-    steps: int,
-    step_size: float,
-) -> torch.Tensor:
-    """使用分类器梯度引导进一步强调敏感区域。"""
-
-    if steps <= 0 or step_size <= 0:
-        return images
-
-    model_before = model_before.to(device).eval()
-    model_after = model_after.to(device).eval()
-
-    guided = images.to(device).clone().detach()
-    mask = mask.to(device, dtype=guided.dtype)
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)
-    mask = mask.unsqueeze(1)  # (1,1,H,W)
-    mask = mask.clamp(0.0, 1.0)
-    if mask.shape[-2:] != guided.shape[-2:]:
-        mask = F.interpolate(mask, size=guided.shape[-2:], mode="bilinear", align_corners=False)
-
-    for _ in range(steps):
-        guided = guided.clamp(0.0, 1.0).detach().requires_grad_(True)
-        model_before.zero_grad(set_to_none=True)
-        logits_before = model_before(_normalize_to_dataset(guided, dataset))
-        loss_before = logits_before[:, target_class].sum()
-        grad_before = torch.autograd.grad(loss_before, guided, retain_graph=True)[0]
-
-        model_after.zero_grad(set_to_none=True)
-        logits_after = model_after(_normalize_to_dataset(guided, dataset))
-        loss_after = logits_after[:, target_class].sum()
-        grad_after = torch.autograd.grad(loss_after, guided)[0]
-
-        grad = (grad_before - grad_after) * mask
-        guided = (guided + step_size * grad).clamp(0.0, 1.0)
-
-    return guided.detach()
-
-
-def _build_penalty_transform(penalties: dict[int, float]):
-    if not penalties:
-        return None
-
-    def transform(scores: torch.Tensor) -> torch.Tensor:
-        adjusted = scores.clone()
-        for cls, factor in penalties.items():
-            adjusted[cls] = adjusted[cls] * factor
-        return adjusted
-
-    return transform
-
-
-def _log_sensitive_features(features: Sequence[SensitiveFeature]) -> None:
-    if not features:
-        LOGGER.info("敏感特征推理：未检测到显著特征，使用基础扩散提示语。")
-        return
-
-    LOGGER.info("敏感特征推理：")
-    for feature in features:
-        LOGGER.info("  来源=%s, 特征=%s, 重要性=%.4f", feature.source, feature.name, feature.score)
 
 
 def _parse_level_thresholds(raw: str | None) -> list[float] | None:
@@ -605,25 +424,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-epochs", type=int, default=1)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--output", type=Path, default=Path("outputs"))
-    parser.add_argument("--reconstructions", type=int, default=8)
-    parser.add_argument(
-        "--reconstruction-tolerance",
-        type=float,
-        default=0.05,
-        help="允许生成样本分类准确率相对测试集差异的最大绝对值 (单位: 比例).",
-    )
-    parser.add_argument(
-        "--reinference-penalty",
-        type=float,
-        default=0.9,
-        help="重推理时对上一轮预测类别的融合得分缩放系数 (0-1).",
-    )
-    parser.add_argument(
-        "--max-reinference",
-        type=int,
-        default=5,
-        help="允许触发的最大重推理次数，超过即判定重建失败。",
-    )
     parser.add_argument(
         "--forgetting-method",
         default="fed_eraser",
@@ -883,154 +683,6 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="边缘纹理分析所采用的边界宽度占比 (0-0.5)。",
     )
-    parser.add_argument(
-        "--diffusion-model-id",
-        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
-        help="Pretrained diffusion pipeline identifier (diffusers).",
-    )
-    parser.add_argument(
-        "--diffusion-steps",
-        type=int,
-        default=40,
-        help="Number of inference steps for diffusion reconstruction.",
-    )
-    parser.add_argument(
-        "--diffusion-guidance",
-        type=float,
-        default=7.5,
-        help="Classifier-free guidance scale for diffusion reconstruction.",
-    )
-    parser.add_argument(
-        "--diffusion-strength",
-        type=float,
-        default=0.7,
-        help="图生图扩散强度 (0-1, 越大越偏离初始图像)。",
-    )
-    parser.add_argument(
-        "--diffusion-negative-prompt",
-        default=None,
-        help="Optional negative prompt for diffusion sampling.",
-    )
-    parser.add_argument(
-        "--diffusion-guidance-epochs",
-        type=int,
-        default=1,
-        help="敏感特征指导扩散模型时的迭代轮次 (启发式设置).",
-    )
-    parser.add_argument(
-        "--diffusion-guidance-lr",
-        type=float,
-        default=1e-4,
-        help="敏感特征指导扩散模型时的学习率 (仅用于记录).",
-    )
-    parser.add_argument(
-        "--diffusion-train-batch-size",
-        type=int,
-        default=2,
-        help="使用遗忘样本微调扩散模型时的批量大小。",
-    )
-    parser.add_argument(
-        "--diffusion-train-steps",
-        type=int,
-        default=0,
-        help="扩散模型微调的最大步数，0 表示不限制。",
-    )
-    parser.add_argument(
-        "--diffusion-prior-blend",
-        type=float,
-        default=0.35,
-        help="采样过程中先验潜变量在热力图区域的融合权重。",
-    )
-    parser.add_argument(
-        "--diffusion-latent-noise",
-        type=float,
-        default=0.05,
-        help="图生图初始扰动在掩模外注入的噪声幅度。",
-    )
-    parser.add_argument(
-        "--diffusion-contrastive-step",
-        type=float,
-        default=0.12,
-        help="对比引导在早期去噪步中的学习率。",
-    )
-    parser.add_argument(
-        "--diffusion-contrastive-min-step",
-        type=float,
-        default=0.02,
-        help="对比引导在末尾去噪步中的最小学习率。",
-    )
-    parser.add_argument(
-        "--diffusion-contrastive-frequency",
-        type=int,
-        default=2,
-        help="执行分类器对比引导的步频（每多少步一次）。",
-    )
-    parser.add_argument(
-        "--diffusion-contrastive-clip",
-        type=float,
-        default=1.5,
-        help="对比梯度的全局范数裁剪阈值。",
-    )
-    parser.add_argument(
-        "--diffusion-contrastive-ema",
-        type=float,
-        default=0.85,
-        help="对比梯度的指数滑动平均系数。",
-    )
-    parser.add_argument(
-        "--diffusion-train-contrastive-weight",
-        type=float,
-        default=0.02,
-        help="扩散微调阶段对比分类器损失的权重系数。",
-    )
-    parser.add_argument(
-        "--diffusion-train-contrastive-interval",
-        type=int,
-        default=2,
-        help="扩散微调阶段插入对比损失的步频 (>=1)。",
-    )
-    parser.add_argument(
-        "--diffusion-pretrain-batches",
-        type=int,
-        default=4,
-        help="使用测试集预热扩散模型时采样的批次数。",
-    )
-    parser.add_argument(
-        "--diffusion-pretrain-epochs",
-        type=int,
-        default=1,
-        help="扩散模型预热的迭代轮次。",
-    )
-    parser.add_argument(
-        "--diffusion-pretrain-lr",
-        type=float,
-        default=5e-5,
-        help="扩散模型预热阶段使用的学习率。",
-    )
-    parser.add_argument(
-        "--diffusion-pretrain-batch-size",
-        type=int,
-        default=None,
-        help="扩散模型预热时的批量大小（缺省时沿用微调批量）。",
-    )
-    parser.add_argument(
-        "--diffusion-pretrain-max-steps",
-        type=int,
-        default=0,
-        help="扩散预热阶段的最大优化步数，0 表示不限制。",
-    )
-    parser.add_argument(
-        "--reconstruction-refine-steps",
-        type=int,
-        default=5,
-        help="重建后使用分类器梯度细化的迭代步数。",
-    )
-    parser.add_argument(
-        "--reconstruction-guidance-weight",
-        type=float,
-        default=0.1,
-        help="分类器梯度细化的步长权重。",
-    )
     return parser.parse_args()
 
 
@@ -1159,7 +811,6 @@ def main() -> None:
             LOGGER.info("用户选择复用已保存的模型权重，跳过联邦训练与遗忘阶段。")
 
     forgetting_result: ForgettingResult | None = None
-    proceed_inference_choice = "yes"
 
     if reuse_saved_models:
         pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
@@ -1241,409 +892,80 @@ def main() -> None:
         torch.save(post_forgetting_model.state_dict(), model_after_path)
         post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
         LOGGER.info(
-            "联邦遗忘操作已执行完毕，遗忘模型信息保存在 %s/model_after.pt。是否按照参数进行标签推理？",
+            "联邦遗忘操作已执行完毕，遗忘模型信息保存在 %s/model_after.pt。",
             args.output,
         )
         LOGGER.info("Accuracy after forgetting: %.4f", post_accuracy)
-        proceed_inference_choice = input("请输入 yes 以继续标签推理: ").strip().lower()
 
-    if proceed_inference_choice != "yes":
-        LOGGER.info("用户拒绝继续标签推理，流程结束。")
-        return
+    LOGGER.info("标签推理阶段：根据遗忘前后模型评估潜在标签。")
 
-    diffusion_config = DiffusionConfig(
-        model_id=args.diffusion_model_id,
-        guidance_scale=args.diffusion_guidance,
-        num_inference_steps=args.diffusion_steps,
+    inference_result = infer_forgotten_label(
+        before=pre_forgetting_model,
+        after=post_forgetting_model,
+        dataloader=federated_dataset.test_loader,
+        num_classes=federated_dataset.num_classes,
         device=device,
-        negative_prompt=args.diffusion_negative_prompt,
-        train_batch_size=args.diffusion_train_batch_size,
-        max_train_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
-        prior_blend_weight=args.diffusion_prior_blend,
-        noise_offset=args.diffusion_latent_noise,
-        strength=args.diffusion_strength,
-        contrastive_step=args.diffusion_contrastive_step,
-        contrastive_min_step=args.diffusion_contrastive_min_step,
-        contrastive_frequency=args.diffusion_contrastive_frequency,
-        contrastive_clip=args.diffusion_contrastive_clip,
-        contrastive_ema=args.diffusion_contrastive_ema,
-        contrastive_train_weight=args.diffusion_train_contrastive_weight,
-        contrastive_train_interval=args.diffusion_train_contrastive_interval,
-        pretrain_epochs=args.diffusion_pretrain_epochs,
-        pretrain_batch_size=args.diffusion_pretrain_batch_size,
-        pretrain_max_steps=None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
+        ground_truth=args.target_class,
+        heatmap_samples=args.inference_heatmap_samples,
+        heatmap_border_ratio=args.inference_heatmap_border_ratio,
+        transform=None,
     )
-    try:
-        diffusion = DiffusionReconstructor(diffusion_config)
-    except RuntimeError as exc:
-        LOGGER.error("Diffusion reconstruction failed: %s", exc)
-        raise SystemExit("Diffusion-based reconstruction requires the 'diffusers' package") from exc
+
+    LOGGER.info("标签推理阶段：输出各类别遗忘前后准确率对比。")
+    for cls_index in range(inference_result.per_class_before.numel()):
+        before_val = float(inference_result.per_class_before[cls_index].item())
+        after_val = float(inference_result.per_class_after[cls_index].item())
+        LOGGER.info(
+            "  类别 %d -> 遗忘前准确率 %.2f%%, 遗忘后准确率 %.2f%%, 下降 %.2f%%",
+            cls_index,
+            before_val * 100,
+            after_val * 100,
+            (before_val - after_val) * 100,
+        )
+
+    if inference_result.first_stage_candidates:
+        LOGGER.info(
+            "第一阶段候选类别：%s",
+            sorted(int(cls) for cls in inference_result.first_stage_candidates),
+        )
+    if inference_result.second_stage_candidates:
+        LOGGER.info(
+            "第二阶段候选类别：%s",
+            sorted(int(cls) for cls in inference_result.second_stage_candidates),
+        )
+    if inference_result.candidate_details:
+        LOGGER.info("候选类别分析：")
+        for cls in sorted(inference_result.candidate_details):
+            metrics = inference_result.candidate_details[cls]
+            LOGGER.info(
+                "  类别 %d -> 综合得分 %.4f, 准确率下降 %.4f, 中心偏移 %.4f, 边缘下降 %.4f",
+                cls,
+                metrics.get("combined_score", 0.0),
+                metrics.get("accuracy_drop", 0.0),
+                metrics.get("center_shift_mean", 0.0),
+                metrics.get("edge_drop_mean", 0.0),
+            )
+    if inference_result.similarity_scores:
+        LOGGER.info(
+            "第二阶段相似度：%s",
+            {cls: round(score, 4) for cls, score in inference_result.similarity_scores.items()},
+        )
+
+    match_status = "是" if inference_result.predicted_class == args.target_class else "否"
     LOGGER.info(
-        "扩散模型参数：模型=%s, 采样步数=%d, 指导尺度=%.2f, 微调批量=%d, 微调步数=%s, 噪声偏移=%.3f, 强度=%.2f",
-        diffusion_config.model_id,
-        diffusion_config.num_inference_steps,
-        diffusion_config.guidance_scale,
-        diffusion_config.train_batch_size,
-        "不限" if diffusion_config.max_train_steps is None else diffusion_config.max_train_steps,
-        diffusion_config.noise_offset,
-        diffusion_config.strength,
-    )
-    LOGGER.info(
-        "对比引导参数：步长(初始)=%.3f, 步长(末尾)=%.3f, 频率=%d, 范数裁剪=%.2f, EMA=%.2f",
-        diffusion_config.contrastive_step,
-        diffusion_config.contrastive_min_step,
-        diffusion_config.contrastive_frequency,
-        diffusion_config.contrastive_clip,
-        diffusion_config.contrastive_ema,
-    )
-    LOGGER.info(
-        "扩散微调对比项：权重=%.4f, 步频=%d",
-        diffusion_config.contrastive_train_weight,
-        diffusion_config.contrastive_train_interval,
-    )
-    LOGGER.info(
-        "重建细化配置：梯度引导步数=%d, 步长=%.3f",
-        args.reconstruction_refine_steps,
-        args.reconstruction_guidance_weight,
+        "标签推理完成：原遗忘类标签=%d, 推理标签=%d, 是否一致？%s",
+        args.target_class,
+        inference_result.predicted_class,
+        match_status,
     )
 
-    pretrain_tensor: torch.Tensor | None = None
-    if args.diffusion_pretrain_batches > 0:
-        LOGGER.info(
-            "扩散预热阶段：计划使用测试集前 %d 个批次进行预训练。",
-            args.diffusion_pretrain_batches,
-        )
-        collected_batches: list[torch.Tensor] = []
-        with torch.no_grad():
-            for batch_idx, (inputs, _) in enumerate(federated_dataset.test_loader):
-                if batch_idx >= args.diffusion_pretrain_batches:
-                    break
-                samples = inputs.detach()
-                try:
-                    stats = get_normalization_stats(args.dataset)
-                    samples = denormalize(samples, stats)
-                except KeyError:
-                    pass
-                collected_batches.append(samples.clamp(0.0, 1.0).cpu())
-        if collected_batches:
-            pretrain_tensor = torch.cat(collected_batches, dim=0)
-        else:
-            LOGGER.warning("测试集样本不足，扩散预热阶段已被跳过。")
-
-    if pretrain_tensor is not None and pretrain_tensor.numel() > 0:
-        diffusion.pretrain(
-            pretrain_tensor,
-            epochs=args.diffusion_pretrain_epochs,
-            learning_rate=args.diffusion_pretrain_lr,
-            batch_size=args.diffusion_pretrain_batch_size or args.diffusion_train_batch_size,
-            max_steps=None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
-            classifier_before=pre_forgetting_model,
-            classifier_after=post_forgetting_model,
-            target_class=args.target_class,
-            dataset=args.dataset,
-        )
-
-    penalties: dict[int, float] = {}
-    reinference_count = 0
-    successful_acc_before: float | None = None
-    successful_acc_after: float | None = None
-    reconstructions: torch.Tensor | None = None
-    inference_result: LabelInferenceResult | None = None
-    class_label: str | None = None
-    user_confirmed_reconstruction = False
-    verification_performed = False
-    selected_init_indices: list[int] | None = None
-    reconstruction_attempt_dirs: list[str] = []
-
-    while True:
-        transform = _build_penalty_transform(penalties)
-        inference = infer_forgotten_label(
-            before=pre_forgetting_model,
-            after=post_forgetting_model,
-            dataloader=federated_dataset.test_loader,
-            num_classes=federated_dataset.num_classes,
-            device=device,
-            ground_truth=args.target_class,
-            heatmap_samples=args.inference_heatmap_samples,
-            heatmap_border_ratio=args.inference_heatmap_border_ratio,
-            transform=transform,
-        )
-
-        LOGGER.info("标签推理阶段：输出各类别遗忘前后准确率对比。")
-        for cls_index in range(inference.per_class_before.numel()):
-            before_val = float(inference.per_class_before[cls_index].item())
-            after_val = float(inference.per_class_after[cls_index].item())
-            LOGGER.info(
-                "  类别 %d -> 遗忘前准确率 %.2f%%, 遗忘后准确率 %.2f%%, 下降 %.2f%%",
-                cls_index,
-                before_val * 100,
-                after_val * 100,
-                (before_val - after_val) * 100,
-            )
-
-        LOGGER.info(
-            "标签推理第 %d 次 -> 预测类别 %d (真实类别 %d)",
-            reinference_count + 1,
-            inference.predicted_class,
-            args.target_class,
-        )
-        if inference.first_stage_candidates:
-            LOGGER.info(
-                "第一阶段候选类别：%s",
-                sorted(int(cls) for cls in inference.first_stage_candidates),
-            )
-        if inference.second_stage_candidates:
-            LOGGER.info(
-                "第二阶段候选类别：%s",
-                sorted(int(cls) for cls in inference.second_stage_candidates),
-            )
-        if inference.candidate_details:
-            LOGGER.info("候选类别分析：")
-            for cls in sorted(inference.candidate_details):
-                metrics = inference.candidate_details[cls]
-                LOGGER.info(
-                    "  类别 %d -> 综合得分 %.4f, 准确率下降 %.4f, 中心偏移 %.4f, 边缘下降 %.4f",
-                    cls,
-                    metrics.get("combined_score", 0.0),
-                    metrics.get("accuracy_drop", 0.0),
-                    metrics.get("center_shift_mean", 0.0),
-                    metrics.get("edge_drop_mean", 0.0),
-                )
-        if inference.similarity_scores:
-            LOGGER.info(
-                "第二阶段相似度：%s",
-                {cls: round(score, 4) for cls, score in inference.similarity_scores.items()},
-            )
-
-        match_status = "是" if inference.predicted_class == args.target_class else "否"
-        LOGGER.info(
-            "标签推理完成：原遗忘类标签=%d, 推理标签=%d, 是否一致？%s",
-            args.target_class,
-            inference.predicted_class,
-            match_status,
-        )
-
-        if federated_dataset.class_names and inference.predicted_class < len(federated_dataset.class_names):
-            class_label = str(federated_dataset.class_names[inference.predicted_class])
-        else:
-            class_label = None
-
-        if not user_confirmed_reconstruction:
-            response = input("是否进一步进行数据重建？(yes继续): ").strip().lower()
-            if response != "yes":
-                LOGGER.info("用户选择不执行数据重建，流程到此结束。")
-                inference_result = inference
-                reconstructions = torch.empty(0)
-                successful_acc_before = 0.0
-                successful_acc_after = 0.0
-                break
-            user_confirmed_reconstruction = True
-
-        LOGGER.info("链路推进：按照指示跳过敏感特征推理，直接基于热力图差异生成掩模。")
-        sensitive_features: list[SensitiveFeature] = []
-        inference.sensitive_features = tuple(sensitive_features)
-        _log_sensitive_features(sensitive_features)
-
-        prior_samples = inference.sample_bank.get(inference.predicted_class, torch.empty(0))
-        diffusion.ingest_priors(prior_samples, args.dataset)
-        guidance_mask = None
-        try:
-            guidance_mask = _build_guidance_mask(inference)
-        except ValueError as exc:
-            LOGGER.warning("构建热力图指导掩模失败：%s，使用全局掩模代替。", exc)
-            shape = INPUT_SHAPES[args.dataset][1:]
-            guidance_mask = torch.ones(shape, dtype=torch.float32)
-        diffusion.set_heatmap_guidance(guidance_mask)
-        LOGGER.info("已将敏感区域掩模注入扩散模型，准备引导微调。")
-
-        denorm_priors: torch.Tensor | None = None
-        if prior_samples is not None and prior_samples.numel() > 0:
-            try:
-                stats = get_normalization_stats(args.dataset)
-                denorm_priors = denormalize(prior_samples, stats).clamp(0.0, 1.0)
-            except KeyError:
-                denorm_priors = prior_samples.clamp(0.0, 1.0)
-        else:
-            LOGGER.warning("预测类别 %d 在样本库中为空，图生图将退化为噪声初始。", inference.predicted_class)
-
-        train_images = denorm_priors
-        init_indices: list[int] = []
-        initial_images: torch.Tensor | None = None
-        if denorm_priors is not None and denorm_priors.numel() > 0:
-            available = denorm_priors.size(0)
-            LOGGER.info("图生图初始图像候选数量：%d", available)
-            prompt_msg = (
-                f"请输入用于图生图初始图像的索引(0-{available - 1}, 逗号分隔, 留空则随机): "
-            )
-            selection_raw = input(prompt_msg).strip()
-            if selection_raw:
-                tokens = [token.strip() for token in selection_raw.split(",") if token.strip()]
-                for token in tokens:
-                    try:
-                        idx = int(token)
-                    except ValueError:
-                        LOGGER.warning("忽略非法索引输入：%s", token)
-                        continue
-                    if 0 <= idx < available:
-                        init_indices.append(idx)
-                    else:
-                        LOGGER.warning("索引 %d 超出范围，已忽略。", idx)
-            if not init_indices:
-                random_idx = int(torch.randint(0, available, (1,)).item())
-                LOGGER.info("未指定索引，随机选择测试样本 %d 作为初始图像。", random_idx)
-                init_indices = [random_idx]
-            else:
-                seen = set()
-                ordered: list[int] = []
-                for idx in init_indices:
-                    if idx not in seen:
-                        ordered.append(idx)
-                        seen.add(idx)
-                init_indices = ordered
-                LOGGER.info("选择的初始测试样本索引：%s", init_indices)
-            initial_images = denorm_priors[init_indices]
-            selected_init_indices = init_indices
-        else:
-            LOGGER.info("缺少同类测试图像，改为随机噪声初始化扩散过程。")
-
-        LOGGER.info(
-            "引导扩散/梯度微调：使用 %d 张初始样本。",
-            0 if train_images is None or train_images.numel() == 0 else train_images.size(0),
-        )
-        diffusion.fine_tune_with_guidance(
-            sensitive_features,
-            epochs=args.diffusion_guidance_epochs,
-            learning_rate=args.diffusion_guidance_lr,
-            images=train_images,
-            class_label=class_label,
-            batch_size=args.diffusion_train_batch_size,
-            max_steps=None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
-            classifier_before=pre_forgetting_model,
-            classifier_after=post_forgetting_model,
-            target_class=inference.predicted_class,
-            dataset=args.dataset,
-        )
-
-        pre_forgetting_model = pre_forgetting_model.to(device)
-        post_forgetting_model = post_forgetting_model.to(device)
-        pre_forgetting_model.eval()
-        post_forgetting_model.eval()
-
-        candidate_reconstructions = diffusion.reconstruct(
-            target_class=inference.predicted_class,
-            num_samples=args.reconstructions,
-            class_label=class_label,
-            init_images=initial_images,
-            classifier_before=pre_forgetting_model,
-            classifier_after=post_forgetting_model,
-            dataset=args.dataset,
-            guidance_frequency=args.diffusion_contrastive_frequency,
-        )
-
-        expected_shape = INPUT_SHAPES[args.dataset]
-        if candidate_reconstructions.shape[1:] != expected_shape:
-            LOGGER.debug(
-                "Resizing reconstructions from %s to expected shape %s",
-                candidate_reconstructions.shape[1:],
-                expected_shape,
-            )
-            candidate_reconstructions = F.interpolate(
-                candidate_reconstructions,
-                size=expected_shape[1:],
-                mode="bilinear",
-                align_corners=False,
-            )
-            if expected_shape[0] == 1 and candidate_reconstructions.shape[1] == 3:
-                candidate_reconstructions = candidate_reconstructions.mean(dim=1, keepdim=True)
-
-        refined_reconstructions = _refine_reconstructions(
-            candidate_reconstructions,
-            model_before=pre_forgetting_model,
-            model_after=post_forgetting_model,
-            target_class=inference.predicted_class,
-            dataset=args.dataset,
-            mask=guidance_mask,
-            device=device,
-            steps=args.reconstruction_refine_steps,
-            step_size=args.reconstruction_guidance_weight,
-        )
-
-        attempt_dir = _export_reconstruction_attempt(
-            refined_reconstructions,
-            args.output,
-            args.dataset,
-            reinference_count + 1,
-        )
-        if attempt_dir is not None:
-            reconstruction_attempt_dirs.append(str(attempt_dir))
-
-        acc_before = _evaluate_reconstruction_accuracy(
-            pre_forgetting_model,
-            refined_reconstructions,
-            inference.predicted_class,
-            args.dataset,
-            device,
-        )
-        acc_after = _evaluate_reconstruction_accuracy(
-            post_forgetting_model,
-            refined_reconstructions,
-            inference.predicted_class,
-            args.dataset,
-            device,
-        )
-        LOGGER.info(
-            "重构评估：遗忘前模型准确率=%.4f, 遗忘后模型准确率=%.4f", acc_before, acc_after
-        )
-
-        if acc_before >= 0.6 and acc_before > acc_after:
-            LOGGER.info(
-                "重建成功：满足准确率约束 (前 %.2f%%, 后 %.2f%%)。",
-                acc_before * 100,
-                acc_after * 100,
-            )
-            verify_choice = input("是否对生成的图像进行验证评估？(yes验证): ").strip().lower()
-            if verify_choice == "yes":
-                verification_performed = True
-                LOGGER.info(
-                    "验证阶段：遗忘前模型准确率=%.4f, 遗忘后模型准确率=%.4f",
-                    acc_before,
-                    acc_after,
-                )
-            else:
-                LOGGER.info("用户选择跳过验证阶段，沿用当前评估结果。")
-            reconstructions = refined_reconstructions
-            successful_acc_before = acc_before
-            successful_acc_after = acc_after
-            inference_result = inference
-            break
-
-        reinference_count += 1
-        LOGGER.error(
-            "重建失败：遗忘前准确率 %.2f%%、遗忘后准确率 %.2f%% 未满足目标，准备重新推理标签。",
-            acc_before * 100,
-            acc_after * 100,
-        )
-        if reinference_count > args.max_reinference:
-            LOGGER.error("超过最大重推理次数 %d，宣布重建失败。", args.max_reinference)
-            raise SystemExit("Reconstruction failed: exceeded maximum reinference attempts")
-
-        penalties[inference.predicted_class] = (
-            penalties.get(inference.predicted_class, 1.0) * args.reinference_penalty
-        )
-        LOGGER.info(
-            "降低类别 %d 的推理得分，乘以惩罚系数 %.2f 后重新推理。",
-            inference.predicted_class,
-            args.reinference_penalty,
-        )
-
-    if inference_result is None:
-        inference_result = inference
-    if reconstructions is None:
-        reconstructions = torch.empty(0)
-    if successful_acc_before is None:
-        successful_acc_before = 0.0
-    if successful_acc_after is None:
-        successful_acc_after = 0.0
+    if (
+        federated_dataset.class_names
+        and inference_result.predicted_class < len(federated_dataset.class_names)
+    ):
+        class_label = str(federated_dataset.class_names[inference_result.predicted_class])
+    else:
+        class_label = None
 
     per_class_records = []
     for cls in range(federated_dataset.num_classes):
@@ -1667,7 +989,6 @@ def main() -> None:
         )
 
     args.output.mkdir(parents=True, exist_ok=True)
-    torch.save(reconstructions, args.output / "reconstructed.pt")
     torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
     torch.save(post_forgetting_model.state_dict(), args.output / "model_after.pt")
     if forgetting_result is not None:
@@ -1708,42 +1029,6 @@ def main() -> None:
             "is_secure": getattr(server.aggregator, "is_secure", False),
         },
         "class_label": class_label,
-        "diffusion_model_id": args.diffusion_model_id,
-        "diffusion_guidance": {
-            "final_scale": diffusion.config.guidance_scale,
-            "epochs": args.diffusion_guidance_epochs,
-            "learning_rate": args.diffusion_guidance_lr,
-            "metadata": getattr(diffusion, "_guidance_hparams", {}),
-        },
-        "diffusion_training": {
-            "batch_size": args.diffusion_train_batch_size,
-            "max_steps": None if args.diffusion_train_steps <= 0 else args.diffusion_train_steps,
-            "prior_blend_weight": args.diffusion_prior_blend,
-            "noise_offset": args.diffusion_latent_noise,
-            "strength": args.diffusion_strength,
-            "contrastive_weight": args.diffusion_train_contrastive_weight,
-            "contrastive_interval": args.diffusion_train_contrastive_interval,
-        },
-        "contrastive_guidance": {
-            "step": args.diffusion_contrastive_step,
-            "min_step": args.diffusion_contrastive_min_step,
-            "frequency": args.diffusion_contrastive_frequency,
-            "clip": args.diffusion_contrastive_clip,
-            "ema": args.diffusion_contrastive_ema,
-        },
-        "diffusion_pretrain": {
-            "batches": args.diffusion_pretrain_batches,
-            "epochs": args.diffusion_pretrain_epochs,
-            "learning_rate": args.diffusion_pretrain_lr,
-            "batch_size": args.diffusion_pretrain_batch_size or args.diffusion_train_batch_size,
-            "max_steps": None if args.diffusion_pretrain_max_steps <= 0 else args.diffusion_pretrain_max_steps,
-            "records": diffusion.pretrain_records,
-        },
-        "reconstruction_accuracy_before": successful_acc_before,
-        "reconstruction_accuracy_after": successful_acc_after,
-        "reconstruction_tolerance": args.reconstruction_tolerance,
-        "verification_performed": verification_performed,
-        "reinference_count": reinference_count,
         "baseline_class_accuracy": float(
             inference_result.per_class_before[inference_result.predicted_class].item()
         ),
@@ -1753,15 +1038,10 @@ def main() -> None:
         "first_stage_candidates": list(inference_result.first_stage_candidates),
         "second_stage_candidates": list(inference_result.second_stage_candidates),
         "similarity_scores": inference_result.similarity_scores,
-        "sensitive_features": [
-            feature.to_dict() for feature in (inference_result.sensitive_features or [])
-        ],
-        "init_image_indices": selected_init_indices if selected_init_indices is not None else [],
         "heatmaps": {
             "enabled": not args.no_heatmaps,
             "cmap": args.heatmap_cmap,
         },
-        "reconstruction_attempt_dirs": reconstruction_attempt_dirs,
         "per_class_accuracy": per_class_records,
     }
 
@@ -1790,10 +1070,10 @@ def main() -> None:
         json.dump(metadata, handle, indent=2)
 
     LOGGER.info(
-        "Saved %d reconstructed samples and inference metadata to %s (重推理次数=%d)",
-        len(reconstructions),
+        "Inference metadata saved to %s。标签推理结果=%d, 是否成功=%s",
         args.output,
-        reinference_count,
+        inference_result.predicted_class,
+        match_status,
     )
 
 
@@ -1824,7 +1104,7 @@ def export_heatmaps(
     dataset: str,
     *,
     gradient_filter: Sequence[str] | None = None,
- dataloader=None,
+    dataloader=None,
     model_before: torch.nn.Module | None = None,
     model_after: torch.nn.Module | None = None,
     device: torch.device | None = None,
