@@ -5,6 +5,8 @@ import argparse
 import copy
 import json
 import logging
+import pickle
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Sequence
@@ -43,6 +45,8 @@ from src.utils.normalization import denormalize, get_normalization_stats
 
 LOGGER = logging.getLogger(__name__)
 
+_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
 
 INPUT_SHAPES: Dict[str, Sequence[int]] = {
     "cifar10": (3, 32, 32),
@@ -77,6 +81,90 @@ def _count_targets_in_dataset(dataset, target_class: int) -> int:
         if int(label) == target_class:
             count += 1
     return count
+
+
+def _parse_version(raw: str | None) -> tuple[int, ...]:
+    """Extract a tuple of numeric components from a version string."""
+
+    if not raw:
+        return ()
+    clean = raw.split("+", 1)[0]
+    numbers: list[int] = []
+    for token in clean.split("."):
+        digits = ""
+        for char in token:
+            if char.isdigit():
+                digits += char
+            else:
+                break
+        if not digits:
+            break
+        numbers.append(int(digits))
+    return tuple(numbers)
+
+
+def _ensure_torch_environment() -> None:
+    """Log detailed runtime information and validate core dependencies."""
+
+    torch_version = _parse_version(torch.__version__)
+    python_version = sys.version_info[:3]
+    LOGGER.info(
+        "运行环境：PyTorch %s, Python %d.%d.%d", torch.__version__, *python_version
+    )
+
+    recommended_torch = (2, 7, 0)
+    if torch_version and torch_version < (2, 0, 0):
+        raise RuntimeError(
+            "项目需要 PyTorch 2.0 及以上版本，请升级当前环境。"
+        )
+    if torch_version and torch_version < recommended_torch:
+        LOGGER.warning(
+            "检测到 PyTorch %s，建议升级至 >=2.7.0 以获得与最新 CUDA 的最佳兼容性。",
+            torch.__version__,
+        )
+    if python_version < (3, 10, 0):
+        LOGGER.warning(
+            "当前 Python 版本 %d.%d.%d 已不在官方支持范围，建议使用 Python 3.12。",
+            *python_version,
+        )
+
+    cuda_runtime = torch.version.cuda or "unknown"
+    if torch.cuda.is_available():
+        try:
+            device_index = torch.cuda.current_device()
+        except Exception:  # pragma: no cover - defensive guard
+            device_index = 0
+        try:
+            device_name = torch.cuda.get_device_name(device_index)
+        except Exception:  # pragma: no cover - defensive guard
+            device_name = "unknown"
+        try:
+            capability_major, capability_minor = torch.cuda.get_device_capability(device_index)
+        except Exception:  # pragma: no cover - defensive guard
+            capability_major, capability_minor = -1, -1
+
+        LOGGER.info(
+            "CUDA 可用：运行时版本 %s，当前设备 %s (计算能力 %s.%s)",
+            cuda_runtime,
+            device_name,
+            capability_major if capability_major >= 0 else "?",
+            capability_minor if capability_minor >= 0 else "?",
+        )
+
+        cuda_version_tuple = _parse_version(cuda_runtime)
+        if cuda_version_tuple and cuda_version_tuple < (12, 0):
+            LOGGER.warning(
+                "检测到 CUDA %s，建议升级至 12.x（如 12.8）以发挥 PyTorch 2.7 的全部性能。",
+                cuda_runtime,
+            )
+    else:
+        LOGGER.warning("未检测到可用的 CUDA 设备，将在 CPU 上执行计算。")
+
+    try:
+        torch.set_float32_matmul_precision("high")
+        LOGGER.debug("已将 float32 矩阵乘法精度设置为 'high' 以匹配 Ampere 及以上 GPU。")
+    except AttributeError:  # pragma: no cover - older torch fallback
+        LOGGER.debug("当前 PyTorch 版本不支持 set_float32_matmul_precision 接口。")
 
 
 def _normalize_heatmap(tensor: torch.Tensor) -> torch.Tensor:
@@ -897,6 +985,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     setup_logging(getattr(logging, args.log_level.upper()))
+    _ensure_torch_environment()
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     LOGGER.info("Using device %s", device)
@@ -1024,7 +1113,9 @@ def main() -> None:
         pre_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
         pre_forgetting_model.load_state_dict(torch.load(model_before_path, map_location=device, weights_only=True))
         post_forgetting_model = build_model(args.dataset, federated_dataset.num_classes)
-        post_forgetting_model.load_state_dict(torch.load(model_after_path, map_location=device))
+        post_forgetting_model.load_state_dict(
+            torch.load(model_after_path, map_location=device, weights_only=True)
+        )
         baseline_accuracy = accuracy(pre_forgetting_model.to(device), federated_dataset.test_loader, device)
         post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
         LOGGER.info(
@@ -1067,7 +1158,11 @@ def main() -> None:
                 reconstruction_threshold=args.oneshot_reconstruction_threshold,
             )
 
-        torch.save(pre_forgetting_model.state_dict(), model_before_path)
+        torch.save(
+            pre_forgetting_model.state_dict(),
+            model_before_path,
+            pickle_protocol=_PICKLE_PROTOCOL,
+        )
         forgetting_params_json = json.dumps(asdict(method_config), ensure_ascii=False)
         LOGGER.info(
             "联邦训练已完成，模型信息保存在 %s/model_before.pt。遗忘配置：目标类别=%d, 方法=%s, 参数=%s。",
@@ -1097,7 +1192,11 @@ def main() -> None:
         )
 
         post_forgetting_model = copy.deepcopy(server.global_model)
-        torch.save(post_forgetting_model.state_dict(), model_after_path)
+        torch.save(
+            post_forgetting_model.state_dict(),
+            model_after_path,
+            pickle_protocol=_PICKLE_PROTOCOL,
+        )
         post_accuracy = accuracy(post_forgetting_model.to(device), federated_dataset.test_loader, device)
         LOGGER.info(
             "联邦遗忘操作已执行完毕，遗忘模型信息保存在 %s/model_after.pt。",
@@ -1197,8 +1296,16 @@ def main() -> None:
         )
 
     args.output.mkdir(parents=True, exist_ok=True)
-    torch.save(pre_forgetting_model.state_dict(), args.output / "model_before.pt")
-    torch.save(post_forgetting_model.state_dict(), args.output / "model_after.pt")
+    torch.save(
+        pre_forgetting_model.state_dict(),
+        args.output / "model_before.pt",
+        pickle_protocol=_PICKLE_PROTOCOL,
+    )
+    torch.save(
+        post_forgetting_model.state_dict(),
+        args.output / "model_after.pt",
+        pickle_protocol=_PICKLE_PROTOCOL,
+    )
     if forgetting_result is not None:
         torch.save(
             {
@@ -1206,6 +1313,7 @@ def main() -> None:
                 "forgotten": forgetting_result.forgotten_state,
             },
             args.output / "models.pt",
+            pickle_protocol=_PICKLE_PROTOCOL,
         )
     if inference_result.gradient_delta is not None:
         torch.save(
@@ -1215,6 +1323,7 @@ def main() -> None:
                 "delta": inference_result.gradient_delta,
             },
             args.output / "gradient_deltas.pt",
+            pickle_protocol=_PICKLE_PROTOCOL,
         )
     with (args.output / "inference.json").open("w", encoding="utf-8") as handle:
         json.dump(inference_result.to_dict(), handle, indent=2)
