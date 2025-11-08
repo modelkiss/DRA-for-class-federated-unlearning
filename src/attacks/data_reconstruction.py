@@ -773,6 +773,14 @@ def _fine_tune_sensitive_features(
     else:
         control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
 
+    compute_dtype = torch.float16 if use_autocast else current_dtype
+    param_dtype = torch.float32 if use_autocast else current_dtype
+
+    control_pipeline.unet.to(device=device, dtype=param_dtype)
+    control_pipeline.controlnet.to(device=device, dtype=param_dtype)
+    control_pipeline.vae.to(device=device, dtype=compute_dtype)
+    current_dtype = compute_dtype
+
     scaler = _make_grad_scaler(use_autocast, device.type)
     optimizer = torch.optim.AdamW(control_pipeline.unet.parameters(), lr=config.learning_rate)
 
@@ -843,8 +851,8 @@ def _fine_tune_sensitive_features(
                 use_autocast = False
                 scaler = _make_grad_scaler(False, device.type)
                 control_pipeline.unet.to(device=device, dtype=current_dtype)
-                control_pipeline.vae.to(device=device, dtype=current_dtype)
                 control_pipeline.controlnet.to(device=device, dtype=current_dtype)
+                control_pipeline.vae.to(device=device, dtype=current_dtype)
                 control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
                 new_lr = config.learning_rate * 0.5
                 LOGGER.warning(
