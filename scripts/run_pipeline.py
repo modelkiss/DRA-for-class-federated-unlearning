@@ -739,8 +739,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sfi-max-classes",
         type=int,
-        default=3,
-        help="敏感特征推理分析的候选类别数量上限。",
+        default=1,
+        help="敏感特征推理分析的类别数量上限（预测类别缺失时的备用选项）。",
     )
     parser.add_argument(
         "--sfi-mask-quantile",
@@ -1309,8 +1309,8 @@ def main() -> None:
     )
     sfi_output = Path("outputs") / "sfi"
     LOGGER.info(
-        "启动敏感特征推理：候选类别≤%d，图块数=%d，掩码分位数=%.2f",
-        sfi_config.max_classes,
+        "启动敏感特征推理：目标类别=%d，图块数=%d，掩码分位数=%.2f",
+        int(inference_result.predicted_class),
         sfi_config.num_patches,
         sfi_config.mask_quantile,
     )

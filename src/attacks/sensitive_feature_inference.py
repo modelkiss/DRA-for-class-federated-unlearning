@@ -19,7 +19,7 @@ from ..utils.normalization import denormalize
 class SensitiveFeatureConfig:
     """Configuration controlling the sensitive feature inference pipeline."""
 
-    max_classes: int = 3
+    max_classes: int = 1
     mask_quantile: float = 0.8
     mask_min_threshold: float = 0.25
     edge_border_ratio: float = 0.2
@@ -227,7 +227,20 @@ def _denormalize_samples(samples: torch.Tensor, stats: Tuple[Tuple[float, ...], 
 
 
 def _prepare_candidate_classes(inference: LabelInferenceResult, limit: int) -> List[int]:
-    priority: List[int] = [int(inference.predicted_class)]
+    """Return the primary class (predicted label) for sensitive feature analysis.
+
+    If the predicted class lacks cached samples—for example due to data loading
+    issues—the function gracefully falls back to other candidates to avoid
+    breaking the downstream pipeline. The fallback still respects the provided
+    ``limit``.
+    """
+
+    predicted = int(inference.predicted_class)
+    samples = inference.sample_bank.get(predicted)
+    if samples is not None and samples.numel() > 0:
+        return [predicted]
+
+    priority: List[int] = [predicted]
     priority.extend(int(cls) for cls in inference.second_stage_candidates)
     priority.extend(int(cls) for cls in inference.first_stage_candidates)
 
