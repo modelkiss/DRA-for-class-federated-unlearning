@@ -40,10 +40,27 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 try:  # pragma: no cover - AMP is optional on CPU-only builds
-    from torch.cuda.amp import GradScaler, autocast
+    from torch.amp import GradScaler as _AmpGradScaler, autocast as _amp_autocast
 except (ImportError, AttributeError):  # pragma: no cover
+    _AmpGradScaler = None  # type: ignore
+    _amp_autocast = None  # type: ignore
+
+try:  # pragma: no cover - CUDA AMP may be unavailable
+    from torch.cuda.amp import GradScaler as _CudaGradScaler, autocast as _cuda_autocast
+except (ImportError, AttributeError):  # pragma: no cover
+    _CudaGradScaler = None  # type: ignore
+    _cuda_autocast = None  # type: ignore
+
+autocast = _amp_autocast or _cuda_autocast  # type: ignore[assignment]
+if _AmpGradScaler is not None:
+    GradScaler = _AmpGradScaler  # type: ignore[assignment]
+    _GRAD_SCALER_REQUIRES_DEVICE_ARG = True
+elif _CudaGradScaler is not None:
+    GradScaler = _CudaGradScaler  # type: ignore[assignment]
+    _GRAD_SCALER_REQUIRES_DEVICE_ARG = False
+else:
     GradScaler = None  # type: ignore
-    autocast = None  # type: ignore
+    _GRAD_SCALER_REQUIRES_DEVICE_ARG = False
 
 
 class _NoOpGradScaler:
@@ -68,10 +85,26 @@ class _NoOpGradScaler:
         return None
 
 
-def _make_grad_scaler(enabled: bool):
-    if GradScaler is None:
+def _make_grad_scaler(enabled: bool, device_type: str | None):
+    if not enabled or GradScaler is None:
         return _NoOpGradScaler()
+    if _GRAD_SCALER_REQUIRES_DEVICE_ARG:
+        if device_type is None:
+            device_type = "cuda"
+        try:
+            return GradScaler(device_type, enabled=enabled)
+        except TypeError:  # pragma: no cover - legacy torch.amp signature
+            return GradScaler(device_type)
     return GradScaler(enabled=enabled)
+
+
+def _autocast_context(device_type: str, dtype: torch.dtype):
+    if autocast is None:
+        return nullcontext()
+    try:
+        return autocast(device_type=device_type, dtype=dtype)
+    except TypeError:  # pragma: no cover - torch.cuda.amp.autocast signature
+        return autocast(dtype=dtype)
 
 from .label_inference import LabelInferenceResult
 from ..utils.metrics import accuracy
@@ -740,7 +773,7 @@ def _fine_tune_sensitive_features(
     else:
         control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
 
-    scaler = _make_grad_scaler(use_autocast)
+    scaler = _make_grad_scaler(use_autocast, device.type)
     optimizer = torch.optim.AdamW(control_pipeline.unet.parameters(), lr=config.learning_rate)
 
     step = 0
@@ -760,7 +793,7 @@ def _fine_tune_sensitive_features(
                 LOGGER.warning("Skipping batch with non-finite control signal during sensitive finetuning")
                 continue
 
-            autocast_cm = autocast(device_type=device.type, dtype=torch.float16) if use_autocast else nullcontext()
+            autocast_cm = _autocast_context(device.type, torch.float16) if use_autocast else nullcontext()
             with autocast_cm:
                 latents = control_pipeline.vae.encode(pixel_values).latent_dist.sample() * 0.18215
                 noise = torch.randn_like(latents)
@@ -808,7 +841,7 @@ def _fine_tune_sensitive_features(
                 )
                 current_dtype = torch.float32
                 use_autocast = False
-                scaler = _make_grad_scaler(False)
+                scaler = _make_grad_scaler(False, device.type)
                 control_pipeline.unet.to(device=device, dtype=current_dtype)
                 control_pipeline.vae.to(device=device, dtype=current_dtype)
                 control_pipeline.controlnet.to(device=device, dtype=current_dtype)
