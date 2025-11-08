@@ -73,6 +73,7 @@ class BaseDiffusionTrainingConfig:
     tokenizer_truncation: bool = True
     prompt_prefix: str = "photo of"
     sample_limit: int | None = None
+    early_stop_loss_threshold: float | None = 0.05
 
 
 @dataclass
@@ -537,9 +538,27 @@ def _train_base_diffusion(
             step += 1
             if step % 50 == 0:
                 LOGGER.info("Base diffusion training step %d/%d, loss=%.4f", step, config.max_train_steps, np.mean(losses))
+            if (
+                config.early_stop_loss_threshold is not None
+                and len(losses) == losses.maxlen
+                and np.mean(losses) <= config.early_stop_loss_threshold
+            ):
+                LOGGER.info(
+                    "Early stopping base diffusion training at step %d because running loss %.4f <= threshold %.4f",
+                    step,
+                    np.mean(losses),
+                    config.early_stop_loss_threshold,
+                )
+                break
             if step >= config.max_train_steps:
                 break
         if step >= config.max_train_steps:
+            break
+        if (
+            config.early_stop_loss_threshold is not None
+            and len(losses) == losses.maxlen
+            and np.mean(losses) <= config.early_stop_loss_threshold
+        ):
             break
 
     pipeline.unet.save_attn_procs(output_dir)
