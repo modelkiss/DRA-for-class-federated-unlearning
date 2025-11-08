@@ -31,7 +31,7 @@ source .venv/bin/activate
 pip install torch torchvision diffusers
 python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
     --target-class 6 --reconstructions 4 --iid \
-   --aggregation secagg --secagg-threshold 3 \
+    --aggregation fedavg \
     --forgetting-method fedaf --fedaf-rounds 3 \
     --diffusion-model-id runwayml/stable-diffusion-v1-5 --dp-method dp-sgd --dp-sgd-noise 0.8
 ```
