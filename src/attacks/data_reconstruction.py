@@ -29,6 +29,7 @@ import logging
 import math
 import random
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -38,6 +39,39 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+try:  # pragma: no cover - AMP is optional on CPU-only builds
+    from torch.cuda.amp import GradScaler, autocast
+except (ImportError, AttributeError):  # pragma: no cover
+    GradScaler = None  # type: ignore
+    autocast = None  # type: ignore
+
+
+class _NoOpGradScaler:
+    """Fallback GradScaler that implements the minimal API we rely on."""
+
+    def __init__(self, enabled: bool = False):
+        self._enabled = False
+
+    def is_enabled(self) -> bool:
+        return False
+
+    def scale(self, loss):
+        return loss
+
+    def unscale_(self, optimizer):  # pragma: no cover - no-op
+        return None
+
+    def step(self, optimizer):  # pragma: no cover - fallback step
+        optimizer.step()
+
+    def update(self):  # pragma: no cover - no-op
+        return None
+
+
+def _make_grad_scaler(enabled: bool):
+    if GradScaler is None:
+        return _NoOpGradScaler()
+    return GradScaler(enabled=enabled)
 
 from .label_inference import LabelInferenceResult
 from ..utils.metrics import accuracy
@@ -580,7 +614,10 @@ def _load_controlnet_pipeline(base_pipeline, controlnet_model_id: str, device: t
             "ControlNet support requires diffusers>=0.21.0"
         ) from exc
 
-    controlnet = ControlNetModel.from_pretrained(controlnet_model_id, torch_dtype=dtype)
+    load_kwargs = {}
+    if dtype == torch.float16:
+        load_kwargs["torch_dtype"] = dtype
+    controlnet = ControlNetModel.from_pretrained(controlnet_model_id, **load_kwargs)
     controlnet_pipeline = StableDiffusionControlNetPipeline(
         vae=base_pipeline.vae,
         text_encoder=base_pipeline.text_encoder,
@@ -591,7 +628,15 @@ def _load_controlnet_pipeline(base_pipeline, controlnet_model_id: str, device: t
         feature_extractor=None,
         controlnet=controlnet,
     )
-    controlnet_pipeline.to(device, dtype=dtype)
+    controlnet_pipeline.to(device)
+    if dtype == torch.float16 and device.type == "cuda":
+        controlnet_pipeline.unet.to(device=device, dtype=dtype)
+        controlnet_pipeline.vae.to(device=device, dtype=dtype)
+        controlnet_pipeline.controlnet.to(device=device, dtype=dtype)
+        # keep text encoder in full precision to avoid numerical issues
+        controlnet_pipeline.text_encoder.to(device=device, dtype=torch.float32)
+    else:
+        controlnet_pipeline.text_encoder.to(device=device, dtype=torch.float32)
     return controlnet_pipeline
 
 
@@ -679,51 +724,113 @@ def _fine_tune_sensitive_features(
 
     control_pipeline = _load_controlnet_pipeline(base_pipeline, config.controlnet_model_id, device, weight_dtype)
     control_pipeline.unet.train()
+
+    current_dtype = weight_dtype
+    use_autocast = current_dtype == torch.float16 and device.type == "cuda" and autocast is not None
+    if current_dtype == torch.float16 and not use_autocast:
+        LOGGER.warning(
+            "AMP is unavailable on device %s; falling back to float32 precision for sensitive finetuning",
+            device,
+        )
+        current_dtype = torch.float32
+        control_pipeline.unet.to(device=device, dtype=current_dtype)
+        control_pipeline.vae.to(device=device, dtype=current_dtype)
+        control_pipeline.controlnet.to(device=device, dtype=current_dtype)
+        control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
+    else:
+        control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
+
+    scaler = _make_grad_scaler(use_autocast)
     optimizer = torch.optim.AdamW(control_pipeline.unet.parameters(), lr=config.learning_rate)
 
     step = 0
     for epoch in range(math.ceil(config.max_train_steps / max(len(dataloader), 1))):
         for batch in dataloader:
-            pixel_values = batch["pixel_values"].to(device, dtype=weight_dtype)
+            optimizer.zero_grad(set_to_none=True)
+
+            pixel_values = batch["pixel_values"].to(device, dtype=current_dtype)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            control = batch["control"].to(device, dtype=weight_dtype)
+            control = batch["control"].to(device, dtype=current_dtype)
 
-            latents = control_pipeline.vae.encode(pixel_values).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, control_pipeline.scheduler.config.num_train_timesteps, (latents.shape[0],), device=device, dtype=torch.long)
-            noisy_latents = control_pipeline.scheduler.add_noise(latents, noise, timesteps)
+            if not torch.isfinite(pixel_values).all():
+                LOGGER.warning("Skipping batch with non-finite pixel values during sensitive finetuning")
+                continue
+            if not torch.isfinite(control).all():
+                LOGGER.warning("Skipping batch with non-finite control signal during sensitive finetuning")
+                continue
 
-            encoder_hidden_states = control_pipeline.text_encoder(input_ids, attention_mask=attention_mask)[0]
+            autocast_cm = autocast(device_type=device.type, dtype=torch.float16) if use_autocast else nullcontext()
+            with autocast_cm:
+                latents = control_pipeline.vae.encode(pixel_values).latent_dist.sample() * 0.18215
+                noise = torch.randn_like(latents)
+                timesteps = torch.randint(
+                    0,
+                    control_pipeline.scheduler.config.num_train_timesteps,
+                    (latents.shape[0],),
+                    device=device,
+                    dtype=torch.long,
+                )
+                noisy_latents = control_pipeline.scheduler.add_noise(latents, noise, timesteps)
 
-            controlnet_output = control_pipeline.controlnet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                controlnet_cond=control,
-                conditioning_scale=config.condition_scale,
-                return_dict=True,
-            )
+                encoder_hidden_states = control_pipeline.text_encoder(input_ids, attention_mask=attention_mask)[0]
 
-            model_pred = control_pipeline.unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states,
-                down_block_additional_residuals=controlnet_output.down_block_res_samples,
-                mid_block_additional_residual=controlnet_output.mid_block_res_sample,
-            ).sample
+                controlnet_output = control_pipeline.controlnet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states,
+                    controlnet_cond=control,
+                    conditioning_scale=config.condition_scale,
+                    return_dict=True,
+                )
 
-            if control_pipeline.scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif control_pipeline.scheduler.config.prediction_type == "v_prediction":
-                target = control_pipeline.scheduler.get_velocity(latents, noise, timesteps)
+                model_pred = control_pipeline.unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states,
+                    down_block_additional_residuals=controlnet_output.down_block_res_samples,
+                    mid_block_additional_residual=controlnet_output.mid_block_res_sample,
+                ).sample
+
+                if control_pipeline.scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif control_pipeline.scheduler.config.prediction_type == "v_prediction":
+                    target = control_pipeline.scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    target = noise
+
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+            if not torch.isfinite(loss):
+                LOGGER.error(
+                    "Sensitive finetuning produced a non-finite loss at step %d; switching to float32 precision",
+                    step + 1,
+                )
+                current_dtype = torch.float32
+                use_autocast = False
+                scaler = _make_grad_scaler(False)
+                control_pipeline.unet.to(device=device, dtype=current_dtype)
+                control_pipeline.vae.to(device=device, dtype=current_dtype)
+                control_pipeline.controlnet.to(device=device, dtype=current_dtype)
+                control_pipeline.text_encoder.to(device=device, dtype=torch.float32)
+                new_lr = config.learning_rate * 0.5
+                LOGGER.warning(
+                    "Sensitive finetuning fallback: using float32 precision and reducing learning rate to %.2e",
+                    new_lr,
+                )
+                optimizer = torch.optim.AdamW(control_pipeline.unet.parameters(), lr=new_lr)
+                continue
+
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(control_pipeline.unet.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                target = noise
-
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(control_pipeline.unet.parameters(), max_norm=1.0)
+                optimizer.step()
 
             step += 1
             if step % 25 == 0:
