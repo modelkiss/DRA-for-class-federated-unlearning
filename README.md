@@ -29,35 +29,53 @@ components:
 python -m venv .venv
 source .venv/bin/activate
 pip install torch torchvision diffusers
-python scripts/run_pipeline.py --dataset cifar10 --num-clients 10 --rounds 5 \
-    --target-class 6 --reconstructions 4 --iid \
-   --aggregation secagg --secagg-threshold 3 \
-    --forgetting-method fedaf --fedaf-rounds 3 \
-    --diffusion-model-id runwayml/stable-diffusion-v1-5 --dp-method dp-sgd --dp-sgd-noise 0.8
+
+# 1. Federated model training (自动迭代直至每类准确率 ≥ 80%)
+python scripts/stage_1_train_model.py --dataset cifar10 --num-clients 10 --iid \
+    --target-accuracy 0.8 --max-rounds 50 --output outputs/stages/training
+
+# 2. 模型遗忘（默认 one-shot）
+python scripts/stage_2_model_forgetting.py --training-summary \
+    outputs/stages/training/training_summary.json --target-class 6 \
+    --method oneshot --output outputs/stages/forgetting
+
+# 3. 标签推理第一轮（计算测试集准确率+推选出60%候选标签）
+python scripts/stage_3_label_inference_round1.py --forgetting-summary \
+    outputs/stages/forgetting/forgetting_summary.json
+
+# 4. 标签推理第二轮（确认最高得分标签）
+python scripts/stage_4_label_inference_round2.py
+
+# 5. 敏感特征推理
+python scripts/stage_5_sensitive_feature_inference.py --dataset cifar10
+
+# 6. 扩散模型初步训练（完全离线，需提前放置模型权重）
+python scripts/stage_6_diffusion_training.py --forgetting-summary \
+    outputs/stages/forgetting/forgetting_summary.json --sfi-summary \
+    outputs/stages/sensitive_features/sensitive_feature_summary.json
+
+# 7. 扩散模型引导生成
+python scripts/stage_7_diffusion_generation.py --forgetting-summary \
+    outputs/stages/forgetting/forgetting_summary.json
 ```
 
-Outputs are stored in the `outputs/` directory (configurable through
-`--output`). Besides the reconstructed tensors and attack report, the pipeline
-logs baseline/post-forgetting accuracies and inferred classes, persists both
-pre/post forgetting model checkpoints (`model_before.pt`, `model_after.pt`,
-`models.pt`), and now exports
-three heatmaps (`heatmap_accuracy_delta_<dataset>.png`、
-`heatmap_confusion_delta_<dataset>.png`、`heatmap_gradient_delta_<dataset>.png`)
-that visualise the per-class accuracy 变化、混淆矩阵差值以及梯度范数差异。默认使用
-Matplotlib 的 `coolwarm` 色图，可通过 `--heatmap-cmap` 修改；若不希望生成热力图，
-可追加 `--no-heatmaps`。
+每个阶段都会在 `outputs/stages/<stage_name>/` 下写入 JSON 摘要文件，后续阶段只需
+读取前一阶段的输出即可继续执行，保证全流程可控可追踪。若需覆盖参数，可使用各
+阶段脚本提供的命令行选项；所有配置都会记录在对应的 summary 中。
 
-常用命令行开关说明：
+### 离线资源准备
 
-- `--forgetting-method`：在 `fed_eraser`、`fedaf`、`one_shot` 三种遗忘策略之间切换。
-- 扩散重建开箱即用，可通过 `--diffusion-model-id`、`--diffusion-guidance`、
-  `--diffusion-steps` 与 `--diffusion-negative-prompt` 微调生成质量。
-- `--aggregation`：选择 `fedavg`、`fedprox`、`secagg`、`ahsecagg`、`fastsecagg`
-  等聚合机制，安全聚合选项可与任意差分隐私策略（`--dp-method`）协同启用。
-- `--dp-method` 及其子参数：分别对应 `dp-sgd`、`ldp-fl`、`adaptive-dp-fl`、`rdp-fl`
-  四种差分隐私策略。
-- `--gradient-batches` 与 `--gradient-params`：指定梯度差分统计所用的数据
-  批次数以及关注的参数子串，从而影响生成的梯度热力图。
+为确保训练与推理全过程无需联网，仓库预先创建了下列目录用于存放所需的模型权重
+与缓存，请将对应的文件手动放置进去：
+
+```
+models/diffusion/base/        # Stable Diffusion 或自有底模
+models/diffusion/controlnet/  # ControlNet 相关权重（可选）
+models/diffusion/cache/       # 其他辅助缓存
+```
+
+若不需要敏感特征引导，可在阶段 6/7 中加上 `--disable-sensitive` 或不提供
+ControlNet 目录。所有脚本均默认读取本地目录，不会触发任何在线下载。
 
 ## Project structure
 
@@ -70,9 +88,15 @@ src/
   models/                 Neural network architectures for each dataset
   utils/                  Shared utilities (logging, metrics)
 scripts/
-  run_pipeline.py         Command-line interface for the full experiment
-  export_reconstructions.py
-                          Utility to decode `reconstructed.pt` tensors into images
+  stage_1_train_model.py             Stage 1 federated training CLI
+  stage_2_model_forgetting.py        Stage 2 forgetting CLI
+  stage_3_label_inference_round1.py  Stage 3 label inference (round 1)
+  stage_4_label_inference_round2.py  Stage 4 label inference (round 2)
+  stage_5_sensitive_feature_inference.py
+                                     Stage 5 sensitive feature inference
+  stage_6_diffusion_training.py      Stage 6 diffusion fine-tuning
+  stage_7_diffusion_generation.py    Stage 7 diffusion guided generation
+  export_reconstructions.py          Decode `reconstructed.pt` tensors into images
 ```
 
 The design keeps the modules composable so that new datasets, models, or attack
@@ -93,10 +117,10 @@ python scripts/export_reconstructions.py \
 
 快速操作步骤：
 
-1. 先运行 `scripts/run_pipeline.py`，确保 `outputs/` 目录中生成了
-   `reconstructed.pt`、`metrics.json` 以及 `inference.json`。
-2. 在同一目录下执行上述命令，脚本会自动反归一化张量并输出单张图片
-   与（若指定 `--grid`）拼图网格。
+1. 按顺序完成阶段 1–7，确保 `outputs/stages/diffusion_generation/` 中生成
+   `reconstruction_summary.json` 与导出的图像批次。
+2. 在同一目录或自定义目录下执行上述命令，脚本会自动反归一化张量并
+   输出单张图片与（若指定 `--grid`）拼图网格。
 3. 输出文件夹中默认包含 `class_<id>_000.png` 等文件名；若同时保存了
    ground-truth 信息，则前缀会写成 `pred6_gt2` 以示区分。
 

@@ -122,7 +122,7 @@ LOGGER = logging.getLogger(__name__)
 class BaseDiffusionTrainingConfig:
     """Configuration for the initial diffusion fine-tuning stage."""
 
-    model_id: str = "runwayml/stable-diffusion-v1-5"
+    model_id: str = "models/diffusion/base"
     method: str = "lora"
     resolution: int = 512
     batch_size: int = 2
@@ -148,7 +148,7 @@ class SensitiveFeatureFinetuneConfig:
     """Configuration for the sensitive feature refinement stage."""
 
     enabled: bool = True
-    controlnet_model_id: str = "lllyasviel/sd-controlnet-canny"
+    controlnet_model_id: str = "models/diffusion/controlnet"
     learning_rate: float = 5e-5
     max_train_steps: int = 800
     batch_size: int = 1
@@ -211,6 +211,30 @@ class AdaptiveBatchRecord:
 @dataclass
 class DataReconstructionResult:
     """Aggregate result returned by :func:`run_data_reconstruction`."""
+
+    predicted_class: int
+    output_dir: str
+    accepted_batches: list[AdaptiveBatchRecord]
+    rejected_batches: list[AdaptiveBatchRecord]
+    config: dict[str, object]
+
+
+@dataclass
+class DiffusionTrainingSummary:
+    """Artifacts persisted after diffusion fine-tuning."""
+
+    predicted_class: int
+    base_dir: str
+    sensitive_dir: str | None
+    generator_dir: str
+    base_prompt: str
+    sample_count: int
+    config: dict[str, object]
+
+
+@dataclass
+class DiffusionGenerationSummary:
+    """Summary of the guided generation stage."""
 
     predicted_class: int
     output_dir: str
@@ -939,6 +963,22 @@ def _generate_images(
     return images
 
 
+def _load_saved_pipeline(directory: Path, device: torch.device):
+    try:
+        from diffusers import DiffusionPipeline
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("DiffusionPipeline requires the diffusers package") from exc
+
+    directory = Path(directory)
+    if not directory.exists():
+        raise FileNotFoundError(f"Saved diffusion weights not found at {directory}")
+
+    torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    pipeline = DiffusionPipeline.from_pretrained(directory, torch_dtype=torch_dtype)
+    pipeline.to(device)
+    return pipeline
+
+
 def _adaptive_generation_loop(
     pipeline,
     *,
@@ -1051,25 +1091,18 @@ def _adaptive_generation_loop(
     return accepted, rejected
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-
-def run_data_reconstruction(
+def run_diffusion_training(
     inference: LabelInferenceResult,
     *,
     dataloader: DataLoader,
     normalization_stats,
-    model_before: nn.Module,
-    model_after: nn.Module,
     output_root: Path,
     device: torch.device,
     config: DataReconstructionConfig | None = None,
-    sfi_summary: dict[str, object] | None = None,
+    sensitive_summary: dict[str, object] | None = None,
     dataset_name: str | None = None,
-) -> DataReconstructionResult:
-    """Execute the full reconstruction workflow."""
+) -> DiffusionTrainingSummary:
+    """Execute diffusion fine-tuning without performing generation."""
 
     if config is None:
         config = DataReconstructionConfig()
@@ -1106,44 +1139,25 @@ def run_data_reconstruction(
     sensitive_pipeline = _fine_tune_sensitive_features(
         base_pipeline=base_pipeline,
         config=config.sensitive,
-        sfi_summary=sfi_summary,
+        sfi_summary=sensitive_summary,
         output_dir=output_root,
         base_prompt=base_prompt,
         device=device,
     )
 
-    generator_pipeline = sensitive_pipeline if config.sensitive.enabled else base_pipeline
+    sensitive_dir = output_root / "sensitive"
+    if not (config.sensitive.enabled and sensitive_dir.exists()):
+        sensitive_dir = None
 
-    control_image = None
-    if sfi_summary is not None and config.sensitive.enabled:
-        class_assets = next(iter(sfi_summary.get("classes", {}).values()), None)
-        if class_assets is not None:
-            controlnet_assets = class_assets.get("controlnet", {})
-            canny_path = Path(controlnet_assets.get("canny_original", ""))
-            if canny_path.exists():
-                control_image = _load_grayscale(canny_path, generator_pipeline.unet.config.sample_size * 8)
-                if control_image.dim() == 2:
-                    control_image = control_image.unsqueeze(0).repeat(3, 1, 1)
-                control_image = control_image.unsqueeze(0)
+    generator_dir = sensitive_dir if sensitive_dir is not None else base_dir
 
-    accepted, rejected = _adaptive_generation_loop(
-        generator_pipeline,
-        config=config.adaptive,
-        prompt=base_prompt,
-        model_before=model_before,
-        model_after=model_after,
-        normalization_stats=normalization_stats,
-        target_class=predicted_class,
-        control_image=control_image,
-        output_dir=output_root,
-        device=device,
-    )
-
-    summary = DataReconstructionResult(
+    summary = DiffusionTrainingSummary(
         predicted_class=predicted_class,
-        output_dir=str(output_root),
-        accepted_batches=accepted,
-        rejected_batches=rejected,
+        base_dir=str(base_dir),
+        sensitive_dir=None if sensitive_dir is None else str(sensitive_dir),
+        generator_dir=str(generator_dir),
+        base_prompt=base_prompt,
+        sample_count=len(samples),
         config={
             "dataset": dataset_name,
             "base": asdict(config.base),
@@ -1152,6 +1166,135 @@ def run_data_reconstruction(
         },
     )
 
+    return summary
+
+
+def run_diffusion_generation(
+    inference: LabelInferenceResult,
+    *,
+    training_summary: DiffusionTrainingSummary,
+    model_before: nn.Module,
+    model_after: nn.Module,
+    normalization_stats,
+    output_root: Path,
+    device: torch.device,
+    adaptive_config: AdaptiveGenerationConfig | dict | None = None,
+    sensitive_summary: dict[str, object] | None = None,
+) -> DiffusionGenerationSummary:
+    """Perform guided generation using previously fine-tuned diffusion weights."""
+
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    pipeline = _load_saved_pipeline(Path(training_summary.generator_dir), device)
+
+    if adaptive_config is None:
+        adaptive_dict = training_summary.config.get("adaptive", {})
+        adaptive = AdaptiveGenerationConfig(**adaptive_dict)
+    elif isinstance(adaptive_config, dict):
+        adaptive = AdaptiveGenerationConfig(**adaptive_config)
+    else:
+        adaptive = adaptive_config
+
+    control_image = None
+    if sensitive_summary is not None and training_summary.sensitive_dir is not None:
+        classes = sensitive_summary.get("classes", {})
+        class_assets = next(iter(classes.values()), None)
+        if class_assets is not None:
+            controlnet_assets = class_assets.get("controlnet", {})
+            canny_path = Path(controlnet_assets.get("canny_original", ""))
+            if canny_path.exists():
+                control_image = _load_grayscale(canny_path, pipeline.unet.config.sample_size * 8)
+                if control_image.dim() == 2:
+                    control_image = control_image.unsqueeze(0).repeat(3, 1, 1)
+                control_image = control_image.unsqueeze(0)
+
+    accepted, rejected = _adaptive_generation_loop(
+        pipeline,
+        config=adaptive,
+        prompt=training_summary.base_prompt,
+        model_before=model_before,
+        model_after=model_after,
+        normalization_stats=normalization_stats,
+        target_class=training_summary.predicted_class,
+        control_image=control_image,
+        output_dir=output_root,
+        device=device,
+    )
+
+    summary = DiffusionGenerationSummary(
+        predicted_class=training_summary.predicted_class,
+        output_dir=str(output_root),
+        accepted_batches=accepted,
+        rejected_batches=rejected,
+        config={
+            "adaptive": asdict(adaptive),
+            "generator_dir": training_summary.generator_dir,
+            "dataset": training_summary.config.get("dataset"),
+        },
+    )
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def run_data_reconstruction(
+    inference: LabelInferenceResult,
+    *,
+    dataloader: DataLoader,
+    normalization_stats,
+    model_before: nn.Module,
+    model_after: nn.Module,
+    output_root: Path,
+    device: torch.device,
+    config: DataReconstructionConfig | None = None,
+    sfi_summary: dict[str, object] | None = None,
+    dataset_name: str | None = None,
+) -> DataReconstructionResult:
+    """Execute the full reconstruction workflow."""
+
+    if config is None:
+        config = DataReconstructionConfig()
+
+    training_summary = run_diffusion_training(
+        inference,
+        dataloader=dataloader,
+        normalization_stats=normalization_stats,
+        output_root=output_root,
+        device=device,
+        config=config,
+        sensitive_summary=sfi_summary,
+        dataset_name=dataset_name,
+    )
+    generation_summary = run_diffusion_generation(
+        inference,
+        training_summary=training_summary,
+        model_before=model_before,
+        model_after=model_after,
+        normalization_stats=normalization_stats,
+        output_root=output_root,
+        device=device,
+        adaptive_config=config.adaptive,
+        sensitive_summary=sfi_summary,
+    )
+
+    summary = DataReconstructionResult(
+        predicted_class=training_summary.predicted_class,
+        output_dir=generation_summary.output_dir,
+        accepted_batches=generation_summary.accepted_batches,
+        rejected_batches=generation_summary.rejected_batches,
+        config={
+            "dataset": dataset_name,
+            "base": asdict(config.base),
+            "sensitive": asdict(config.sensitive),
+            "adaptive": asdict(config.adaptive),
+        },
+    )
+
+    output_root = Path(output_root)
     with (output_root / "reconstruction_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -1175,6 +1318,10 @@ __all__ = [
     "DataReconstructionConfig",
     "AdaptiveBatchRecord",
     "DataReconstructionResult",
+    "DiffusionTrainingSummary",
+    "DiffusionGenerationSummary",
+    "run_diffusion_training",
+    "run_diffusion_generation",
     "run_data_reconstruction",
 ]
 
