@@ -58,6 +58,24 @@ def _ensure_directory(path: Path) -> Path:
     return path
 
 
+def _safe_save(obj: object, path: Path) -> None:
+    """Persist an object with a fallback for large PyTorch checkpoints."""
+
+    try:
+        torch.save(obj, path)
+    except RuntimeError as exc:  # pragma: no cover - defensive fallback
+        message = str(exc)
+        if "PytorchStreamWriter" in message or "unexpected pos" in message:
+            LOGGER.warning(
+                "Falling back to legacy serialization for %s due to save error: %s",
+                path,
+                exc,
+            )
+            torch.save(obj, path, _use_new_zipfile_serialization=False)
+        else:
+            raise
+
+
 def _load_model(dataset: str, num_classes: int, weights: Path, device: torch.device) -> torch.nn.Module:
     model = build_model(dataset, num_classes)
     state = torch.load(weights, map_location=device)
@@ -173,7 +191,7 @@ def run_model_training_stage(config: TrainingStageConfig) -> TrainingStageResult
 
     output_dir = _ensure_directory(Path(config.output_dir))
     model_path = output_dir / "federated_model.pt"
-    torch.save(server.global_model.state_dict(), model_path)
+    _safe_save(server.global_model.state_dict(), model_path)
 
     per_class_dict = {int(idx): float(value) for idx, value in enumerate(best_per_class.cpu())}
     config_dict = {
@@ -317,8 +335,8 @@ def run_model_forgetting_stage(config: ForgettingStageConfig) -> ForgettingStage
     pre_model_path = output_dir / "model_before.pt"
     post_model_path = output_dir / "model_after.pt"
 
-    torch.save(forgetting.original_state, pre_model_path)
-    torch.save(forgetting.forgotten_state, post_model_path)
+    _safe_save(forgetting.original_state, pre_model_path)
+    _safe_save(forgetting.forgotten_state, post_model_path)
 
     post_model = _load_model(dataset_name, dataset.num_classes, post_model_path, device)
     baseline_model = _load_model(dataset_name, dataset.num_classes, pre_model_path, device)
@@ -439,7 +457,7 @@ def run_label_inference_stage_one(config: LabelInferenceStageConfig) -> LabelInf
 
     inference_dir = _ensure_directory(Path(config.output_dir))
     inference_path = inference_dir / "label_inference.pt"
-    torch.save(inference, inference_path)
+    _safe_save(inference, inference_path)
 
     summary = LabelInferenceStageOneResult(
         inference_path=inference_path,
